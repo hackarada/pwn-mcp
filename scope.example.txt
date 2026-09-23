@@ -1,0 +1,19 @@
+# pwn-mcp authorized scope
+# One entry per line. Copy to scope.txt (or point PWN_MCP_SCOPE at it).
+
+# Exact host (apex only)
+example.com
+
+# Apex + all subdomains
+*.target-corp.com
+
+# Single IP
+192.168.56.101
+
+# CIDR range
+10.10.10.0/24
+
+# Exclusions win over broader inclusions
+!blocked.example
+!10.0.0.0/24
+!*.internal.corp

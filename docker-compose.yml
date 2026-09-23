@@ -1,0 +1,49 @@
+services:
+  pwn-mcp:
+    build:
+      context: .
+      args:
+        # Set to "false" for a leaner image without subfinder/nuclei
+        INSTALL_PD_TOOLS: ${INSTALL_PD_TOOLS:-true}
+    image: pwn-mcp:latest
+    restart: unless-stopped
+    ports:
+      - "${PWN_MCP_PORT:-8000}:8000"
+      # Intercepting proxy (only useful when PWN_MCP_PROXY_PORT is set)
+      - "${PWN_MCP_PROXY_PUBLISH:-8080}:8080"
+    environment:
+      PWN_MCP_TRANSPORT: http
+      PWN_MCP_HOST: "0.0.0.0"
+      PWN_MCP_PORT: "8000"
+      # Optional: require Authorization: Bearer <token>
+      PWN_MCP_AUTH_TOKEN: ${PWN_MCP_AUTH_TOKEN:-}
+      # Optional: path inside the container to a scope file
+      PWN_MCP_SCOPE: ${PWN_MCP_SCOPE:-}
+      # Optional: auto-start mitmproxy (bind all interfaces in containers)
+      PWN_MCP_PROXY_PORT: ${PWN_MCP_PROXY_PORT:-}
+      PWN_MCP_PROXY_HOST: ${PWN_MCP_PROXY_HOST:-0.0.0.0}
+      # Refresh nuclei templates on each container start (default on)
+      PWN_MCP_UPDATE_NUCLEI_TEMPLATES: ${PWN_MCP_UPDATE_NUCLEI_TEMPLATES:-true}
+    volumes:
+      # Mount your authorized scope (leave PWN_MCP_SCOPE empty for unrestricted/CTF mode)
+      - ${PWN_MCP_SCOPE_FILE:-./scope.example.txt}:/data/scope.txt:ro
+      # Persist mitmproxy CA so agents can trust the same cert across restarts
+      - mitm-ca:/home/pwnmcp/.mitmproxy
+      # Persist nuclei templates across restarts (updated on boot by entrypoint)
+      - nuclei-templates:/home/pwnmcp/nuclei-templates
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  mitm-ca:
+  nuclei-templates:

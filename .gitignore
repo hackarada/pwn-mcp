@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test, lint, and type-check caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+
+# Secrets and local runtime state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Operator scope. Copy scope.example.txt to scope.txt locally.
+scope.txt
+
+# mitmproxy CA generated on first proxy start
+.mitmproxy/
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local agent / IDE state
+.cursor/
+
+# Compose overrides that may contain local ports or tokens
+docker-compose.override.yml
+docker-compose.*.override.yml
