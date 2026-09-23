@@ -1,4 +1,23 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pwn}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pwn}
+      POSTGRES_DB: ${POSTGRES_DB:-pwn_mcp}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      # Host publish optional (default off). Set POSTGRES_PUBLISH=5432 to expose.
+      - "${POSTGRES_PUBLISH:-127.0.0.1:5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   pwn-mcp:
     build:
       context: .
@@ -7,6 +26,9 @@ services:
         INSTALL_PD_TOOLS: ${INSTALL_PD_TOOLS:-true}
     image: pwn-mcp:latest
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "${PWN_MCP_PORT:-8000}:8000"
       # Intercepting proxy (only useful when PWN_MCP_PROXY_PORT is set)
@@ -24,6 +46,9 @@ services:
       PWN_MCP_PROXY_HOST: ${PWN_MCP_PROXY_HOST:-0.0.0.0}
       # Refresh nuclei templates on each container start (default on)
       PWN_MCP_UPDATE_NUCLEI_TEMPLATES: ${PWN_MCP_UPDATE_NUCLEI_TEMPLATES:-true}
+      # PostgreSQL for background jobs (dbmate migrations on boot)
+      DATABASE_URL: ${DATABASE_URL:-postgres://pwn:pwn@postgres:5432/pwn_mcp?sslmode=disable}
+      DBMATE_MIGRATIONS_DIR: /app/.migration
     volumes:
       # Mount your authorized scope (leave PWN_MCP_SCOPE empty for unrestricted/CTF mode)
       - ${PWN_MCP_SCOPE_FILE:-./scope.example.txt}:/data/scope.txt:ro
@@ -47,3 +72,4 @@ services:
 volumes:
   mitm-ca:
   nuclei-templates:
+  pg-data:

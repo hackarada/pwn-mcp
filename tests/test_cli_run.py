@@ -59,7 +59,7 @@ def test_extract_positional_targets():
 async def test_cli_tools_lists_allowlist(mcp_client: Client):
     r = await mcp_client.call_tool("scan_cli_tools", {})
     names = {t["tool"] for t in r.data["tools"]}
-    assert names == {"dig", "nmap", "nuclei", "subfinder", "whois"}
+    assert names >= {"dig", "nmap", "nuclei", "subfinder", "whois", "httpx", "katana"}
 
 
 async def test_cli_run_rejects_shell_and_unknown(mcp_client: Client):

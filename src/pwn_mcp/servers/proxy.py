@@ -130,3 +130,124 @@ def set_headers(headers: dict[str, str]) -> dict:
 def clear() -> dict:
     """Clear the in-memory traffic history buffer."""
     return proxy_manager.clear_history()
+
+
+@mcp.tool(
+    tags={"proxy"},
+    annotations={"openWorldHint": False},
+)
+def intercept(
+    enabled: bool,
+    filters: list[dict[str, str]] | None = None,
+) -> dict:
+    """Enable/disable request intercept (breakpoint). Optional host/path/method filters.
+
+    Args:
+        enabled: True to hold matching requests for agent review.
+        filters: List of {host?, path?, method?} — empty means hold all.
+    """
+    return proxy_manager.set_intercept(enabled, filters)
+
+
+@mcp.tool(
+    tags={"proxy"},
+    annotations={"readOnlyHint": True, "openWorldHint": False},
+)
+def held() -> dict:
+    """List currently intercepted (held) flows awaiting resume or drop."""
+    return proxy_manager.list_held()
+
+
+@mcp.tool(
+    tags={"proxy"},
+    annotations={"openWorldHint": False},
+)
+def resume(
+    flow_id: str,
+    drop: bool = False,
+    set_headers: dict[str, str] | None = None,
+    set_body: str | None = None,
+    set_method: str | None = None,
+    set_url: str | None = None,
+) -> dict:
+    """Resume or drop a held intercepted flow, optionally mutating the request first.
+
+    Args:
+        flow_id: Held flow id from proxy_held.
+        drop: If true, kill the request instead of forwarding.
+        set_headers: Headers to set/override before resume.
+        set_body: Replace request body.
+        set_method: Replace HTTP method.
+        set_url: Replace full URL.
+    """
+    return proxy_manager.resume_flow(
+        flow_id,
+        drop=drop,
+        set_headers=set_headers,
+        set_body=set_body,
+        set_method=set_method,
+        set_url=set_url,
+    )
+
+
+@mcp.tool(
+    tags={"proxy"},
+    annotations={"openWorldHint": True},
+)
+def replay(flow_id: str, overrides: dict | None = None) -> dict:
+    """Replay a captured history flow (repeater) with optional overrides.
+
+    Args:
+        flow_id: Flow id from proxy_history.
+        overrides: Optional {method, url, headers, body}.
+    """
+    return proxy_manager.replay(flow_id, overrides)
+
+
+@mcp.tool(
+    tags={"proxy"},
+    annotations={"openWorldHint": False},
+)
+def match_replace(rules: list[dict[str, str]]) -> dict:
+    """Set match/replace rules applied to proxied traffic.
+
+    Args:
+        rules: Each {scope, match, replace} where scope is one of
+            req_header, req_body, req_url, resp_header, resp_body.
+    """
+    return proxy_manager.set_match_replace(rules)
+
+
+@mcp.tool(
+    tags={"proxy"},
+    annotations={"readOnlyHint": True, "openWorldHint": False},
+)
+def match_replace_list() -> dict:
+    """Show current match/replace rules."""
+    return proxy_manager.get_match_replace()
+
+
+@mcp.tool(
+    tags={"proxy"},
+    annotations={"readOnlyHint": True, "openWorldHint": False},
+)
+def export_har(limit: int = 200) -> dict:
+    """Export recent proxy history as HAR 1.2 JSON.
+
+    Args:
+        limit: Max flows to include.
+    """
+    return proxy_manager.export_har(limit=limit)
+
+
+@mcp.tool(
+    tags={"proxy"},
+    annotations={"readOnlyHint": True, "openWorldHint": False},
+)
+def export_burp(limit: int = 100) -> dict:
+    """Export recent proxy history as Burp-like XML.
+
+    Args:
+        limit: Max flows to include.
+    """
+    return proxy_manager.export_burp(limit=limit)

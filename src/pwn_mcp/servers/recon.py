@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import socket
 import ssl
+from collections import Counter
 from datetime import UTC, datetime
 from urllib.parse import urljoin, urlparse
 
@@ -237,7 +239,57 @@ async def tech_fingerprint(url: str) -> dict:
     for tech, patterns in _BODY_MARKERS.items():
         if any(re.search(p, body) for p in patterns):
             detected[tech] = "body marker"
-    return {"url": str(resp.url), "status": resp.status_code, "detected": detected}
+    stack_bugs = _stack_bug_hints(detected, resp.headers, body)
+    return {
+        "url": str(resp.url),
+        "status": resp.status_code,
+        "detected": detected,
+        "stack_bug_hints": stack_bugs,
+    }
+
+
+_STACK_BUG_HINTS = {
+    "WordPress": "plugins / REST auth / xmlrpc",
+    "Next.js": "server-action SSRF / open redirect / middleware bypass",
+    "Laravel": "mass assignment / IDOR / debug mode",
+    "Django": "DEBUG / IDOR / SSRF via redirects",
+    "Rails": "mass assignment / IDOR on :id / SSRF",
+    "React": "client-side secrets in bundles / XSS sinks",
+    "Angular": "template injection / XSS",
+    "Vue.js": "client XSS / prototype pollution",
+    "Express.js": "prototype pollution / path traversal",
+    "PHP": "LFI / type juggling / unserialize",
+    "Java (Tomcat/JBoss)": "actuators / deserialization / path traversal",
+    "ASP.NET": "ViewState / ReturnUrl open redirect",
+}
+
+
+def _stack_bug_hints(detected: dict, headers, body: str) -> list[str]:
+    hints: list[str] = []
+    for key, val in detected.items():
+        tech = key.split(":", 1)[-1] if key.startswith("cookie:") else key
+        if tech in _STACK_BUG_HINTS:
+            hints.append(f"{tech} → {_STACK_BUG_HINTS[tech]}")
+        elif val in _STACK_BUG_HINTS:
+            hints.append(f"{val} → {_STACK_BUG_HINTS[val]}")
+    powered = (headers.get("x-powered-by") or "").lower()
+    server = (headers.get("server") or "").lower()
+    if "express" in powered:
+        hints.append(f"Express.js → {_STACK_BUG_HINTS['Express.js']}")
+    if "flask" in powered or "werkzeug" in server:
+        hints.append("Flask → SSTI / SSRF")
+    if "spring" in powered or "spring" in body[:4000].lower():
+        hints.append("Spring → actuators / SpEL / IDOR")
+    if "graphql" in body[:8000].lower():
+        hints.append("GraphQL → introspection / mutation authz / batching")
+    # dedupe preserve order
+    seen: set[str] = set()
+    out = []
+    for h in hints:
+        if h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
 
 
 @mcp.tool(
@@ -436,14 +488,44 @@ async def crawl_links(url: str) -> dict:
 
 _SECRET_PATTERNS = {
     "aws_access_key": r"AKIA[0-9A-Z]{16}",
+    "aws_secret_key": r'''(?i)aws[_-]?secret[_-]?access[_-]?key["'\s]*[:=]["'\s]*([A-Za-z0-9/+=]{40})''',
     "google_api_key": r"AIza[0-9A-Za-z_-]{35}",
     "slack_token": r"xox[baprs]-[0-9A-Za-z-]+",
     "github_token": r"gh[pousr]_[0-9A-Za-z]{36,}",
     "stripe_key": r"[sr]k_(live|test)_[0-9A-Za-z]{16,}",
     "private_key_block": r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
     "jwt": r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*",
+    "bearer_token": r'''(?i)bearer\s+([A-Za-z0-9\-_.=]{20,})''',
+    "basic_auth_url": r'''[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s:@]+@[^/\s]+''',
     "generic_secret": r'''(?i)(api[_-]?key|apikey|secret|client_secret|auth[_-]?token|access[_-]?token)["'\s]*[:=]["'\s]*[0-9A-Za-z_\-]{16,}''',
 }
+
+
+def _find_secrets(text: str) -> dict[str, list[str]]:
+    found: dict[str, list[str]] = {}
+    for name, pattern in _SECRET_PATTERNS.items():
+        matches = {m if isinstance(m, str) else m[0] for m in re.findall(pattern, text)}
+        if matches:
+            found[name] = sorted(
+                {m[:14] + "…" if len(m) > 16 else m for m in matches}
+            )[:20]
+    # high-entropy strings (heuristic)
+    entropy_hits = []
+    for m in re.findall(r'''["']([A-Za-z0-9+/=_-]{32,})["']''', text):
+        if _shannon(m) >= 4.5 and not m.startswith("http"):
+            entropy_hits.append(m[:14] + "…")
+    if entropy_hits:
+        found["high_entropy"] = sorted(set(entropy_hits))[:15]
+    return found
+
+
+def _shannon(s: str) -> float:
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    length = len(s)
+    return -sum((c / length) * math.log2(c / length) for c in counts.values())
+
 
 _API_PATH = re.compile(r'''["'`]((?:/api|/v\d+|/graphql|/auth|/rest|/oauth)[^"'`\s]*)["'`]''')
 
@@ -495,15 +577,7 @@ async def js_analyze(url: str, max_bundles: int = 5) -> dict:
                 r'''["'`]((?:https?://[^"'`\s]+)/(?:api|v\d+|graphql|rest)[^"'`\s]*)["'`]''', js)}
             all_endpoints |= endpoints
 
-            secrets_found = {}
-            for name, pattern in _SECRET_PATTERNS.items():
-                matches = {m if isinstance(m, str) else m[0]
-                           for m in re.findall(pattern, js)}
-                if matches:
-                    # redact long secrets — show prefix only
-                    secrets_found[name] = sorted(
-                        {m[:14] + "…" if len(m) > 16 else m for m in matches})[:20]
-
+            secrets_found = _find_secrets(js)
             sourcemap = None
             sm = re.search(r"//#\s*sourceMappingURL=(\S+)", js)
             if sm:
@@ -697,5 +771,139 @@ async def scope_check(target: str) -> dict:
         "scope_configured": True,
         "scope_source": scope.source,
         "reason": "in_scope" if allowed else "outside_scope",
+    }
+
+
+@mcp.tool(
+    tags={"recon", "active"},
+    annotations={"openWorldHint": True},
+    timeout=45.0,
+)
+async def secrets_scan(url: str, body: str | None = None) -> dict:
+    """Scan a URL response (or supplied body) for secrets and high-entropy tokens.
+
+    Args:
+        url: URL to fetch when body is omitted.
+        body: Optional raw text to scan instead of fetching.
+    """
+    source = "body"
+    text = body or ""
+    meta: dict = {"url": url}
+    if body is None:
+        source = "fetched"
+        async with _client() as client:
+            try:
+                r = await client.get(url)
+            except httpx.HTTPError as e:
+                raise ToolError(f"Request failed: {e}") from e
+            text = r.text
+            meta["status"] = r.status_code
+            meta["content_type"] = r.headers.get("content-type", "")
+    secrets = _find_secrets(text[:500_000])
+    return {**meta, "source": source, "secrets": secrets, "hit_types": list(secrets)}
+
+
+@mcp.tool(
+    tags={"recon", "active"},
+    annotations={"openWorldHint": True},
+    timeout=30.0,
+)
+async def session_extract(url: str, headers: dict[str, str] | None = None) -> dict:
+    """Fetch a page and extract cookies, CSRF tokens, and auth-related form fields.
+
+    Args:
+        url: Page URL (login or any authenticated page).
+        headers: Optional request headers (e.g. Cookie for an existing session).
+    """
+    async with _client() as client:
+        try:
+            r = await client.get(url, headers=headers or {})
+        except httpx.HTTPError as e:
+            raise ToolError(f"Request failed: {e}") from e
+
+    cookies = []
+    for raw in r.headers.get_list("set-cookie"):
+        name = raw.split("=", 1)[0].strip()
+        attrs = raw.lower()
+        cookies.append({
+            "name": name,
+            "httponly": "httponly" in attrs,
+            "secure": "secure" in attrs,
+            "samesite": (
+                "none" if "samesite=none" in attrs
+                else "lax" if "samesite=lax" in attrs
+                else "strict" if "samesite=strict" in attrs
+                else None
+            ),
+        })
+
+    csrf_patterns = [
+        r'''(?i)name=["']csrf[^"']*["'][^>]*value=["']([^"']+)["']''',
+        r'''(?i)name=["']_token["'][^>]*value=["']([^"']+)["']''',
+        r'''(?i)name=["']authenticity_token["'][^>]*value=["']([^"']+)["']''',
+        r'''(?i)name=["']__RequestVerificationToken["'][^>]*value=["']([^"']+)["']''',
+        r'''(?i)<meta[^>]+name=["']csrf-token["'][^>]+content=["']([^"']+)["']''',
+        r'''(?i)csrfmiddlewaretoken["'\s]*value=["']([^"']+)["']''',
+    ]
+    csrf_tokens = []
+    for pat in csrf_patterns:
+        for m in re.findall(pat, r.text):
+            csrf_tokens.append(m[:80])
+
+    return {
+        "url": str(r.url),
+        "status": r.status_code,
+        "cookies": cookies,
+        "csrf_tokens": sorted(set(csrf_tokens))[:20],
+        "set_cookie_count": len(cookies),
+    }
+
+
+@mcp.tool(
+    tags={"recon"},
+    annotations={"readOnlyHint": True, "openWorldHint": False},
+)
+async def url_triage(urls: list[str], patterns: list[str] | None = None) -> dict:
+    """Triage a caller-supplied URL list into gf-style buckets (no network).
+
+    Args:
+        urls: Absolute or relative URLs / paths to classify.
+        patterns: Optional subset of buckets: interesting_params, api, admin,
+            auth, upload, redirect, ssrf, idor, debug.
+    """
+    return _triage_urls(urls, patterns)
+
+
+_GF_PATTERNS: dict[str, re.Pattern[str]] = {
+    "interesting_params": re.compile(
+        r"[?&](id|user|user_id|uid|account|file|path|filepath|doc|document|"
+        r"url|uri|redirect|next|return|dest|destination|continue|src|source|"
+        r"token|key|api_key|apikey|secret|callback|ref)=",
+        re.I,
+    ),
+    "api": re.compile(r"/api/|/v\d+/|/graphql|/rest/|/swagger|/openapi", re.I),
+    "admin": re.compile(r"/admin|/internal|/debug|/console|/manage|/dashboard|/backoffice", re.I),
+    "auth": re.compile(r"/oauth|/login|/logout|/auth|/sso|/saml|/callback|/token|/session|/register|/signup", re.I),
+    "upload": re.compile(r"upload|attachment|avatar|document|import|file", re.I),
+    "redirect": re.compile(r"[?&](redirect|next|url|return|returnTo|continue|dest|destination|goto|r)=", re.I),
+    "ssrf": re.compile(r"[?&](url|uri|path|dest|redirect|proxy|fetch|webhook|callback|target|host)=", re.I),
+    "idor": re.compile(r"/(\d{2,})(?:/|$|\?)|[?&](id|user_id|uid|account_id|order_id)=\d+", re.I),
+    "debug": re.compile(r"/debug|/trace|/actuator|/metrics|/env|/phpinfo|/server-status|/\.git", re.I),
+}
+
+
+def _triage_urls(urls: list[str], patterns: list[str] | None = None) -> dict:
+    wanted = patterns or list(_GF_PATTERNS)
+    buckets: dict[str, list[str]] = {k: [] for k in wanted if k in _GF_PATTERNS}
+    unknown = [k for k in wanted if k not in _GF_PATTERNS]
+    for u in urls:
+        for name, cre in _GF_PATTERNS.items():
+            if name in buckets and cre.search(u):
+                buckets[name].append(u)
+    return {
+        "buckets": {k: v[:80] for k, v in buckets.items()},
+        "counts": {k: len(v) for k, v in buckets.items()},
+        "input_count": len(urls),
+        "unknown_patterns": unknown,
     }
 

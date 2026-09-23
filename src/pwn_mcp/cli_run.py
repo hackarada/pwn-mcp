@@ -77,6 +77,12 @@ class ToolPolicy:
     positional_targets: bool = False
 
 
+_PD_OUTPUT_DENIED = frozenset({
+    "-o", "-output", "-oJ", "-oD", "-oI", "-oN", "-oX", "-oG", "-oA", "-oS",
+    "-json-export", "-je", "-jle", "-jsonl-export", "-me", "-markdown-export",
+    "-se", "-sarif-export", "-pe", "-pdf-export",
+})
+
 TOOL_POLICIES: dict[str, ToolPolicy] = {
     "nuclei": ToolPolicy(
         description="ProjectDiscovery vulnerability scanner",
@@ -109,6 +115,56 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
             "-config", "-provider-config",
         }),
         positional_targets=False,
+    ),
+    "httpx": ToolPolicy(
+        description="ProjectDiscovery HTTP probe (binary; not the Python package)",
+        target_flags=frozenset({"-u", "-target"}),
+        denied_flags=_PD_OUTPUT_DENIED | frozenset({
+            "-l", "-list",
+            "-srd", "-store-response-dir", "-sr", "-store-response",
+            "-csv-export", "-parquet-export",
+        }),
+        positional_targets=False,
+    ),
+    "katana": ToolPolicy(
+        description="ProjectDiscovery web crawler",
+        target_flags=frozenset({"-u"}),
+        denied_flags=_PD_OUTPUT_DENIED | frozenset({
+            "-list", "-l",
+            "-config", "-store-response", "-sr", "-store-response-dir", "-srd",
+        }),
+        positional_targets=False,
+    ),
+    "naabu": ToolPolicy(
+        description="ProjectDiscovery port scanner",
+        target_flags=frozenset({"-host", "-h"}),
+        denied_flags=_PD_OUTPUT_DENIED | frozenset({
+            "-list", "-l", "-config", "-nmap-cli",
+        }),
+        positional_targets=False,
+    ),
+    "dnsx": ToolPolicy(
+        description="ProjectDiscovery DNS toolkit",
+        target_flags=frozenset({"-d", "-domain"}),
+        denied_flags=_PD_OUTPUT_DENIED | frozenset({
+            "-l", "-list", "-config",
+        }),
+        positional_targets=False,
+    ),
+    "ffuf": ToolPolicy(
+        description="Web fuzzer (allowlist-only; not baked in Docker by default)",
+        target_flags=frozenset({"-u"}),
+        denied_flags=frozenset({
+            "-o", "-of", "-od", "-request", "-request-proto",
+            "-input-cmd", "-debuglog",
+        }),
+        positional_targets=False,
+    ),
+    "assetfinder": ToolPolicy(
+        description="Subdomain finder (allowlist-only)",
+        target_flags=frozenset(),
+        denied_flags=frozenset(),
+        positional_targets=True,
     ),
     "nmap": ToolPolicy(
         description="Network port / service scanner",

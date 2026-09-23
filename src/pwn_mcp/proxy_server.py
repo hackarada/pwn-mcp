@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections
 import datetime
+import html as html_mod
 import logging
 import os
 import threading
@@ -12,6 +14,7 @@ import time
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
+import httpx
 from mitmproxy import http, options
 from mitmproxy.tools.dump import DumpMaster
 
@@ -38,6 +41,11 @@ class MitmScopeAndTelemetryAddon:
         self.history: collections.deque[dict[str, Any]] = collections.deque(maxlen=max_history)
         self.request_count = 0
         self.blocked_count = 0
+        # Intercept / match-replace (Burp-lite)
+        self.intercept_enabled = False
+        self.intercept_filters: list[dict[str, str]] = []
+        self.held: dict[str, http.HTTPFlow] = {}
+        self.match_replace_rules: list[dict[str, str]] = []
 
     def _is_host_allowed_sync(self, host: str) -> bool:
         """Check scope in a thread-safe synchronous manner.
@@ -55,6 +63,65 @@ class MitmScopeAndTelemetryAddon:
                 return future.result(timeout=3.0)
             except Exception:
                 return True  # Fail open on scope check errors
+
+    def _apply_match_replace(self, flow: http.HTTPFlow, phase: str) -> None:
+        """Apply match/replace rules for request or response phase."""
+        for rule in list(self.match_replace_rules):
+            scope = rule.get("scope", "")
+            match = rule.get("match", "")
+            replace = rule.get("replace", "")
+            if not match:
+                continue
+            if phase == "request":
+                if scope == "req_header":
+                    for k in list(flow.request.headers.keys()):
+                        v = flow.request.headers.get(k, "")
+                        if match in v:
+                            flow.request.headers[k] = v.replace(match, replace)
+                elif scope == "req_body" and flow.request.content:
+                    try:
+                        text = flow.request.get_text(strict=False)
+                        if match in text:
+                            flow.request.set_text(text.replace(match, replace))
+                    except Exception:
+                        pass
+                elif scope == "req_url":
+                    url = flow.request.pretty_url
+                    if match in url:
+                        # only rewrite path/query portion safely
+                        new_url = url.replace(match, replace)
+                        flow.request.url = new_url
+            elif phase == "response" and flow.response:
+                if scope == "resp_header":
+                    for k in list(flow.response.headers.keys()):
+                        v = flow.response.headers.get(k, "")
+                        if match in v:
+                            flow.response.headers[k] = v.replace(match, replace)
+                elif scope == "resp_body" and flow.response.content:
+                    try:
+                        text = flow.response.get_text(strict=False)
+                        if match in text:
+                            flow.response.set_text(text.replace(match, replace))
+                    except Exception:
+                        pass
+
+    def _matches_intercept(self, flow: http.HTTPFlow) -> bool:
+        if not self.intercept_enabled:
+            return False
+        if not self.intercept_filters:
+            return True
+        host = flow.request.pretty_host
+        path = flow.request.path or ""
+        method = flow.request.method.upper()
+        for f in self.intercept_filters:
+            if f.get("host") and f["host"].lower() not in host.lower():
+                continue
+            if f.get("method") and f["method"].upper() != method:
+                continue
+            if f.get("path") and f["path"] not in path:
+                continue
+            return True
+        return False
 
     def request(self, flow: http.HTTPFlow) -> None:
 
@@ -84,10 +151,18 @@ class MitmScopeAndTelemetryAddon:
         for header, value in self.custom_headers.items():
             flow.request.headers[header] = value
 
+        self._apply_match_replace(flow, "request")
+
+        if self._matches_intercept(flow):
+            with self._lock:
+                self.held[flow.id] = flow
+            flow.intercept()
+
     def response(self, flow: http.HTTPFlow) -> None:
         # Don't double-record flows blocked in request()
         if flow.response and flow.response.headers.get("X-Pwn-Mcp") == "Scope-Blocked":
             return
+        self._apply_match_replace(flow, "response")
         self._record_flow(flow, scope_status="allowed")
 
     def error(self, flow: http.HTTPFlow) -> None:
@@ -283,6 +358,11 @@ class ProxyManager:
             "requests_blocked": blocked_count,
             "history_size": history_len,
             "custom_headers": custom_headers,
+            "intercept_enabled": self.addon.intercept_enabled if self.addon else False,
+            "held_count": len(self.addon.held) if self.addon else 0,
+            "match_replace_rules": (
+                len(self.addon.match_replace_rules) if self.addon else 0
+            ),
             "agent_env_setup": (
                 f'export HTTP_PROXY="{proxy_url}" && '
                 f'export HTTPS_PROXY="{proxy_url}" && '
@@ -397,6 +477,236 @@ class ProxyManager:
             count = len(self.addon.history)
             self.addon.history.clear()
         return {"status": "cleared", "cleared_entries": count}
+
+    def set_intercept(
+        self,
+        enabled: bool,
+        filters: list[dict[str, str]] | None = None,
+    ) -> dict:
+        if not self.addon:
+            return {"status": "proxy_not_initialized"}
+        with self.addon._lock:
+            self.addon.intercept_enabled = enabled
+            if filters is not None:
+                self.addon.intercept_filters = list(filters)
+            return {
+                "status": "ok",
+                "intercept_enabled": self.addon.intercept_enabled,
+                "filters": list(self.addon.intercept_filters),
+                "held_count": len(self.addon.held),
+            }
+
+    def list_held(self) -> dict:
+        if not self.addon:
+            return {"held": []}
+        with self.addon._lock:
+            held = []
+            for fid, flow in self.addon.held.items():
+                held.append({
+                    "id": fid,
+                    "method": flow.request.method,
+                    "url": flow.request.pretty_url,
+                    "host": flow.request.pretty_host,
+                    "path": flow.request.path,
+                })
+            return {"held": held, "intercept_enabled": self.addon.intercept_enabled}
+
+    def resume_flow(
+        self,
+        flow_id: str,
+        drop: bool = False,
+        set_headers: dict[str, str] | None = None,
+        set_body: str | None = None,
+        set_method: str | None = None,
+        set_url: str | None = None,
+    ) -> dict:
+        if not self.addon:
+            return {"status": "proxy_not_initialized"}
+        with self.addon._lock:
+            flow = self.addon.held.pop(flow_id, None)
+        if not flow:
+            return {"status": "not_found", "flow_id": flow_id}
+        if drop:
+            flow.kill()
+            return {"status": "dropped", "flow_id": flow_id}
+        if set_method:
+            flow.request.method = set_method.upper()
+        if set_url:
+            flow.request.url = set_url
+        if set_headers:
+            for k, v in set_headers.items():
+                flow.request.headers[k] = v
+        if set_body is not None:
+            flow.request.set_text(set_body)
+        flow.resume()
+        return {"status": "resumed", "flow_id": flow_id}
+
+    def set_match_replace(self, rules: list[dict[str, str]]) -> dict:
+        """Replace all match/replace rules.
+
+        Each rule: {scope: req_header|req_body|req_url|resp_header|resp_body,
+                    match: str, replace: str}
+        """
+        if not self.addon:
+            return {"status": "proxy_not_initialized"}
+        allowed = {"req_header", "req_body", "req_url", "resp_header", "resp_body"}
+        cleaned = []
+        for r in rules:
+            scope = r.get("scope", "")
+            if scope not in allowed:
+                continue
+            cleaned.append({
+                "scope": scope,
+                "match": r.get("match", ""),
+                "replace": r.get("replace", ""),
+            })
+        with self.addon._lock:
+            self.addon.match_replace_rules = cleaned
+        return {"status": "ok", "rules": cleaned}
+
+    def get_match_replace(self) -> dict:
+        if not self.addon:
+            return {"rules": []}
+        with self.addon._lock:
+            return {"rules": list(self.addon.match_replace_rules)}
+
+    def replay(
+        self,
+        flow_id: str,
+        overrides: dict[str, Any] | None = None,
+    ) -> dict:
+        """Replay a captured flow via httpx with optional overrides."""
+        record = self.get_flow(flow_id)
+        if not record:
+            return {"status": "not_found", "flow_id": flow_id}
+        ov = overrides or {}
+        method = (ov.get("method") or record["method"]).upper()
+        url = ov.get("url") or record["url"]
+        headers = dict(record.get("request_headers") or {})
+        headers.update(ov.get("headers") or {})
+        # Drop hop-by-hop
+        for h in ("Host", "Content-Length", "Transfer-Encoding", "Connection"):
+            headers.pop(h, None)
+            headers.pop(h.lower(), None)
+        body = ov.get("body")
+        if body is None:
+            body = record.get("request_body_preview") or None
+        try:
+            with httpx.Client(timeout=20.0, verify=False, follow_redirects=False) as client:
+                resp = client.request(method, url, headers=headers, content=body)
+            return {
+                "status": "ok",
+                "request": {"method": method, "url": url, "headers": headers},
+                "response": {
+                    "status_code": resp.status_code,
+                    "headers": dict(resp.headers),
+                    "body_preview": resp.text[:2000],
+                    "size": len(resp.content),
+                },
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def export_har(self, limit: int = 200) -> dict:
+        """Export recent history as HAR 1.2 JSON structure."""
+        records = self.get_history(limit=limit)
+        entries = []
+        for r in reversed(records):
+            entries.append({
+                "startedDateTime": r.get("iso_time"),
+                "time": r.get("duration_ms") or 0,
+                "request": {
+                    "method": r["method"],
+                    "url": r["url"],
+                    "httpVersion": "HTTP/1.1",
+                    "headers": [
+                        {"name": k, "value": v}
+                        for k, v in (r.get("request_headers") or {}).items()
+                    ],
+                    "queryString": [
+                        {"name": k, "value": v}
+                        for k, v in parse_qsl(urlparse(r["url"]).query)
+                    ],
+                    "cookies": [],
+                    "headersSize": -1,
+                    "bodySize": len(r.get("request_body_preview") or ""),
+                    "postData": {
+                        "mimeType": (r.get("request_headers") or {}).get(
+                            "content-type", "application/octet-stream"
+                        ),
+                        "text": r.get("request_body_preview") or "",
+                    },
+                },
+                "response": {
+                    "status": r.get("status_code") or 0,
+                    "statusText": "",
+                    "httpVersion": "HTTP/1.1",
+                    "headers": [
+                        {"name": k, "value": v}
+                        for k, v in (r.get("response_headers") or {}).items()
+                    ],
+                    "cookies": [],
+                    "content": {
+                        "size": len(r.get("response_body_preview") or ""),
+                        "mimeType": r.get("content_type") or "",
+                        "text": r.get("response_body_preview") or "",
+                    },
+                    "redirectURL": "",
+                    "headersSize": -1,
+                    "bodySize": len(r.get("response_body_preview") or ""),
+                },
+                "cache": {},
+                "timings": {"send": 0, "wait": r.get("duration_ms") or 0, "receive": 0},
+            })
+        return {
+            "log": {
+                "version": "1.2",
+                "creator": {"name": "pwn-mcp", "version": "0.1.0"},
+                "entries": entries,
+            }
+        }
+
+    def export_burp(self, limit: int = 100) -> dict:
+        """Export history as a simplified Burp-like XML items document."""
+        records = self.get_history(limit=limit)
+        items = ['<?xml version="1.0"?>', "<items burpVersion=\"pwn-mcp\" exportTime=\"\">"]
+        for r in reversed(records):
+            req_raw = (
+                f"{r['method']} {urlparse(r['url']).path or '/'} HTTP/1.1\r\n"
+                + "".join(
+                    f"{k}: {v}\r\n" for k, v in (r.get("request_headers") or {}).items()
+                )
+                + "\r\n"
+                + (r.get("request_body_preview") or "")
+            )
+            resp_raw = ""
+            if r.get("status_code"):
+                resp_raw = (
+                    f"HTTP/1.1 {r['status_code']} \r\n"
+                    + "".join(
+                        f"{k}: {v}\r\n"
+                        for k, v in (r.get("response_headers") or {}).items()
+                    )
+                    + "\r\n"
+                    + (r.get("response_body_preview") or "")
+                )
+            items.append("<item>")
+            items.append(f"<time>{html_mod.escape(r.get('iso_time') or '')}</time>")
+            items.append(f"<url><![CDATA[{r.get('url') or ''}]]></url>")
+            items.append(f"<host>{html_mod.escape(r.get('host') or '')}</host>")
+            items.append(f"<method>{html_mod.escape(r.get('method') or '')}</method>")
+            items.append(
+                f"<status>{r.get('status_code') if r.get('status_code') is not None else ''}</status>"
+            )
+            items.append(
+                f"<request base64=\"true\">{base64.b64encode(req_raw.encode()).decode()}</request>"
+            )
+            items.append(
+                f"<response base64=\"true\">{base64.b64encode(resp_raw.encode()).decode()}</response>"
+            )
+            items.append("</item>")
+        items.append("</items>")
+        return {"format": "burp_xml", "xml": "\n".join(items), "count": len(records)}
 
 
 # Global singleton instance

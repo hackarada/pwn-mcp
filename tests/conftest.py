@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 from fastmcp import Client
 
 from pwn_mcp.server import mcp
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TEST_DATABASE_URL = (
+    "postgres://pwn:pwn@127.0.0.1:5432/pwn_mcp?sslmode=disable"
+)
 
 PAGE = """<!doctype html>
 <html><head>
@@ -160,6 +168,51 @@ def http_server():
     thread.start()
     yield f"http://127.0.0.1:{port}"
     server.shutdown()
+
+
+@pytest.fixture(scope="session")
+def database_url() -> str:
+    """Postgres URL for job-store tests (dbmate-managed schema)."""
+    url = (
+        os.environ.get("DATABASE_URL", "").strip()
+        or os.environ.get("PWN_MCP_DATABASE_URL", "").strip()
+        or DEFAULT_TEST_DATABASE_URL
+    )
+    os.environ["DATABASE_URL"] = url
+    migrations = ROOT / ".migration"
+    result = subprocess.run(
+        [
+            "dbmate",
+            "--url", url,
+            "--migrations-dir", str(migrations),
+            "--wait",
+            "--wait-timeout", "30s",
+            "up",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(
+            "PostgreSQL not available for job tests. "
+            "Start compose postgres (docker compose up -d postgres) "
+            f"or set DATABASE_URL. dbmate: {result.stderr or result.stdout}"
+        )
+    return url
+
+
+@pytest.fixture
+def job_db(database_url: str):
+    """Fresh jobs table for each test that needs the store."""
+    from pwn_mcp import store
+
+    store.reset_pool()
+    store.init_db()
+    store.truncate_jobs()
+    yield database_url
+    store.truncate_jobs()
+    store.reset_pool()
 
 
 @pytest.fixture

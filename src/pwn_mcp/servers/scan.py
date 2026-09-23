@@ -10,7 +10,7 @@ import shlex
 import string
 import subprocess
 from importlib.resources import files
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import dns.asyncresolver
 import httpx
@@ -906,10 +906,11 @@ async def cli_run(
 ) -> dict:
     """Run an allowlisted CLI with validated argv (no shell).
 
-    Allowlisted: nuclei, subfinder, nmap, whois, dig. See ``scan_cli_tools``.
+    Allowlisted: nuclei, subfinder, nmap, whois, dig, httpx, katana, naabu,
+    dnsx, ffuf, assetfinder. See ``scan_cli_tools``.
     Arguments cannot contain shell metacharacters, absolute paths, or ``..``.
     File I/O / dangerous flags are denied. Targets parsed from argv
-    (``-u``/``-d``/positionals) are enforced against the active scope.
+    (``-u``/``-d``/``-host``/positionals) are enforced against the active scope.
 
     Args:
         tool: Allowlisted binary name, e.g. 'nuclei'.
@@ -939,5 +940,603 @@ async def cli_run(
         raise ToolError(str(e)) from e
 
     result["scoped_hosts"] = hosts
+    return result
+
+
+# --- Phase 2: PD wrappers, discovery, probes, takeover ---
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=180.0,
+)
+async def httpx_probe(url: str, args: str = "-silent -status-code -title -tech-detect") -> str:
+    """Probe a URL with ProjectDiscovery httpx (requires httpx binary on PATH).
+
+    Args:
+        url: Target URL.
+        args: Extra httpx flags (``-u`` is set from url).
+    """
+    if not which("httpx"):
+        raise ToolError("httpx binary not found on PATH (ProjectDiscovery httpx)")
+    return await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: run_cmd(["httpx", "-u", url, *shlex.split(args)], timeout=160),
+    )
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=180.0,
+)
+async def katana_crawl(url: str, args: str = "-silent -d 2 -jc") -> str:
+    """Crawl with ProjectDiscovery katana (requires katana on PATH).
+
+    Args:
+        url: Seed URL.
+        args: Extra katana flags (``-u`` is set from url).
+    """
+    if not which("katana"):
+        raise ToolError("katana not found on PATH")
+    return await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: run_cmd(["katana", "-u", url, *shlex.split(args)], timeout=160),
+    )
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=180.0,
+)
+async def naabu_scan(host: str, args: str = "-silent -top-ports 100") -> str:
+    """Port scan with ProjectDiscovery naabu (requires naabu on PATH).
+
+    Args:
+        host: Target hostname or IP.
+        args: Extra naabu flags (``-host`` is set from host).
+    """
+    if not which("naabu"):
+        raise ToolError("naabu not found on PATH")
+    return await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: run_cmd(["naabu", "-host", host, *shlex.split(args)], timeout=160),
+    )
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=90.0,
+)
+async def dnsx_resolve(domain: str, args: str = "-silent -a -resp") -> str:
+    """Resolve with ProjectDiscovery dnsx (requires dnsx on PATH).
+
+    Args:
+        domain: Domain to resolve.
+        args: Extra dnsx flags (``-d`` is set from domain).
+    """
+    if not which("dnsx"):
+        raise ToolError("dnsx not found on PATH")
+    return await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: run_cmd(["dnsx", "-d", domain, *shlex.split(args)], timeout=80),
+    )
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=300.0,
+)
+async def content_discover(
+    url: str,
+    extra_paths: list[str] | None = None,
+    from_sitemap: bool = True,
+    from_js: bool = True,
+    recurse_depth: int = 1,
+    concurrency: int = 20,
+) -> dict:
+    """Content discovery 2.0: bundled wordlist + sitemap/JS-fed paths + optional recurse.
+
+    Args:
+        url: Base URL.
+        extra_paths: Caller-supplied paths to probe.
+        from_sitemap: Pull paths from /sitemap.xml.
+        from_js: Extract path-like strings from linked JS (first page).
+        recurse_depth: When a directory-like hit is found, probe children one level (0/1).
+        concurrency: Max parallel requests.
+    """
+    base = url.rstrip("/")
+    paths: set[str] = set(_wordlist("dirpaths.txt"))
+    for p in extra_paths or []:
+        paths.add(p.lstrip("/"))
+
+    async with httpx.AsyncClient(
+        timeout=10.0, verify=False, headers={"User-Agent": UA}, follow_redirects=False,
+    ) as client:
+        if from_sitemap:
+            try:
+                sm = await client.get(f"{base}/sitemap.xml")
+                if sm.status_code == 200:
+                    for loc in re.findall(r"<loc>([^<]+)</loc>", sm.text)[:200]:
+                        path = urlparse(loc).path.lstrip("/")
+                        if path:
+                            paths.add(path)
+            except httpx.HTTPError:
+                pass
+        if from_js:
+            try:
+                page = await client.get(base)
+                for src in re.findall(r'''src=["']([^"']+\.js[^"']*)["']''', page.text, re.I)[:5]:
+                    try:
+                        jr = await client.get(urljoin(str(page.url), src))
+                        for m in re.findall(r'''["'`](/[a-zA-Z0-9_\-./]{2,80})["'`]''', jr.text):
+                            if not m.startswith("//") and "." not in m.rsplit("/", 1)[-1]:
+                                paths.add(m.lstrip("/"))
+                    except httpx.HTTPError:
+                        continue
+            except httpx.HTTPError:
+                pass
+
+        sem = asyncio.Semaphore(concurrency)
+        hits: list[dict] = []
+
+        async def probe(path: str) -> None:
+            async with sem:
+                try:
+                    r = await client.get(f"{base}/{path.lstrip('/')}")
+                except httpx.HTTPError:
+                    return
+            if r.status_code == 404:
+                return
+            hits.append({
+                "path": "/" + path.lstrip("/"),
+                "status": r.status_code,
+                "size": len(r.content),
+                "location": r.headers.get("location"),
+            })
+
+        await asyncio.gather(*(probe(p) for p in sorted(paths)[:800]))
+
+        if recurse_depth >= 1:
+            dirs = [
+                h["path"] for h in hits
+                if h["status"] in (200, 301, 302, 403) and h["path"].endswith("/")
+            ][:30]
+            child_words = ["index", "admin", "config", "backup", "test", "api", "v1", "v2"]
+            children = [f"{d.rstrip('/')}/{w}" for d in dirs for w in child_words]
+            await asyncio.gather(*(probe(p) for p in children))
+
+    hits.sort(key=lambda h: (h["status"], h["path"]))
+    return {"base": base, "tested": len(paths), "hits": hits[:400]}
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=60.0,
+)
+async def ssrf_probe(
+    url: str,
+    param: str,
+    canary_host: str = "169.254.169.254",
+    method: str = "GET",
+) -> dict:
+    """Probe a parameter for SSRF by injecting internal/metadata URLs.
+
+    Uses detection-friendly targets (metadata IP, localhost). Does not use OAST.
+
+    Args:
+        url: Target URL containing the parameter.
+        param: Parameter name to inject into.
+        canary_host: Host/IP embedded in the SSRF payload (default AWS metadata).
+        method: GET or POST.
+    """
+    payloads = [
+        f"http://{canary_host}/",
+        f"http://{canary_host}/latest/meta-data/",
+        "http://127.0.0.1/",
+        "http://localhost/",
+        "http://[::1]/",
+        f"http://0:{canary_host}",
+    ]
+    findings = []
+    async with httpx.AsyncClient(
+        timeout=12.0, verify=False, headers={"User-Agent": UA}, follow_redirects=False,
+    ) as client:
+        baseline_url = _with_params(url, {param: "https://example.com"})
+        try:
+            if method.upper() == "POST":
+                base_r = await client.post(url, data={param: "https://example.com"})
+            else:
+                base_r = await client.get(baseline_url)
+            base_len = len(base_r.content)
+            base_status = base_r.status_code
+        except httpx.HTTPError as e:
+            return {"url": url, "param": param, "error": str(e), "findings": []}
+
+        for payload in payloads:
+            try:
+                if method.upper() == "POST":
+                    r = await client.post(url, data={param: payload})
+                else:
+                    r = await client.get(_with_params(url, {param: payload}))
+            except httpx.HTTPError as e:
+                findings.append({"payload": payload, "error": str(e)})
+                continue
+            body = r.text.lower()
+            signals = []
+            if "ami-id" in body or "instance-id" in body or "meta-data" in body:
+                signals.append("cloud_metadata_body")
+            if "root:x:" in body or "localhost" in body and r.status_code == 200:
+                signals.append("local_content_hint")
+            if abs(len(r.content) - base_len) > 200 or r.status_code != base_status:
+                signals.append("response_diff")
+            findings.append({
+                "payload": payload,
+                "status": r.status_code,
+                "size": len(r.content),
+                "signals": signals,
+                "interesting": bool(signals),
+            })
+    return {
+        "url": url,
+        "param": param,
+        "findings": findings,
+        "vulnerable": any(f.get("interesting") for f in findings),
+    }
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=60.0,
+)
+async def idor_probe(
+    url: str,
+    param: str,
+    ids: list[str] | None = None,
+    headers_a: dict[str, str] | None = None,
+    headers_b: dict[str, str] | None = None,
+) -> dict:
+    """Compare responses across object IDs / two auth contexts for IDOR signals.
+
+    Args:
+        url: URL with the object parameter.
+        param: ID parameter name.
+        ids: Object IDs to try (default: 1, 2, 100, 9999).
+        headers_a: Auth context A (e.g. user cookie).
+        headers_b: Auth context B (optional second user); when set, compares A vs B
+            on the same id.
+    """
+    test_ids = ids or ["1", "2", "100", "9999"]
+    results = []
+    async with httpx.AsyncClient(
+        timeout=12.0, verify=False, headers={"User-Agent": UA}, follow_redirects=True,
+    ) as client:
+        for oid in test_ids:
+            entry: dict = {"id": oid}
+            try:
+                ra = await client.get(
+                    _with_params(url, {param: oid}), headers=headers_a or {}
+                )
+                entry["a"] = {"status": ra.status_code, "size": len(ra.content),
+                              "preview": truncate(ra.text, 200)}
+            except httpx.HTTPError as e:
+                entry["a"] = {"error": str(e)}
+                results.append(entry)
+                continue
+            if headers_b:
+                try:
+                    rb = await client.get(
+                        _with_params(url, {param: oid}), headers=headers_b
+                    )
+                    entry["b"] = {"status": rb.status_code, "size": len(rb.content),
+                                  "preview": truncate(rb.text, 200)}
+                    entry["diff"] = (
+                        entry["a"]["status"] == entry["b"]["status"]
+                        and abs(entry["a"]["size"] - entry["b"]["size"]) < 32
+                        and entry["a"]["status"] == 200
+                    )
+                    entry["note"] = (
+                        "same body for two auth contexts — possible IDOR"
+                        if entry["diff"] else "responses differ"
+                    )
+                except httpx.HTTPError as e:
+                    entry["b"] = {"error": str(e)}
+            results.append(entry)
+
+    statuses = [r.get("a", {}).get("status") for r in results if "a" in r]
+    cross_id_leak = (
+        len(set(s for s in statuses if s == 200)) >= 2
+        and not headers_b
+    )
+    return {
+        "url": url,
+        "param": param,
+        "results": results,
+        "cross_id_200": cross_id_leak,
+        "auth_context_same": any(r.get("diff") for r in results),
+        "vulnerable": bool(cross_id_leak or any(r.get("diff") for r in results)),
+    }
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=45.0,
+)
+async def cache_probe(url: str, poison_header: str = "X-Forwarded-Host") -> dict:
+    """Probe for web-cache poisoning via unkeyed headers.
+
+    Args:
+        url: Target URL.
+        poison_header: Header to inject (X-Forwarded-Host, X-Original-URL, ...).
+    """
+    canary = f"pwncache-{_canary()}.evil"
+    async with httpx.AsyncClient(
+        timeout=12.0, verify=False, headers={"User-Agent": UA}, follow_redirects=False,
+    ) as client:
+        try:
+            baseline = await client.get(url)
+            poisoned = await client.get(url, headers={poison_header: canary})
+            check = await client.get(url)
+        except httpx.HTTPError as e:
+            return {"url": url, "error": str(e)}
+
+    reflected = canary.lower() in poisoned.text.lower() or canary.lower() in str(
+        poisoned.headers
+    ).lower()
+    persisted = canary.lower() in check.text.lower()
+    cache_headers = {
+        k: poisoned.headers.get(k)
+        for k in ("x-cache", "cf-cache-status", "age", "cache-control", "via")
+        if poisoned.headers.get(k)
+    }
+    return {
+        "url": url,
+        "poison_header": poison_header,
+        "canary": canary,
+        "reflected_in_poison_response": reflected,
+        "persisted_on_clean_request": persisted,
+        "cache_headers": cache_headers,
+        "baseline_status": baseline.status_code,
+        "poison_status": poisoned.status_code,
+        "vulnerable": bool(persisted),
+    }
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=45.0,
+)
+async def host_header_probe(url: str, evil_host: str = "evil.example") -> dict:
+    """Probe Host / X-Forwarded-Host handling for poisoning and password-reset issues.
+
+    Args:
+        url: Target URL.
+        evil_host: Attacker host to inject.
+    """
+    findings = []
+    async with httpx.AsyncClient(
+        timeout=12.0, verify=False, headers={"User-Agent": UA}, follow_redirects=False,
+    ) as client:
+        variants = [
+            {"Host": evil_host},
+            {"X-Forwarded-Host": evil_host},
+            {"X-Host": evil_host},
+            {"Forwarded": f"host={evil_host}"},
+        ]
+        for hdrs in variants:
+            try:
+                # httpx sets Host from URL; use header override carefully
+                r = await client.get(url, headers=hdrs)
+            except httpx.HTTPError as e:
+                findings.append({"headers": hdrs, "error": str(e)})
+                continue
+            body_hit = evil_host.lower() in r.text.lower()
+            loc = r.headers.get("location", "")
+            loc_hit = evil_host.lower() in loc.lower()
+            findings.append({
+                "headers": hdrs,
+                "status": r.status_code,
+                "reflected_body": body_hit,
+                "reflected_location": loc_hit,
+                "location": loc[:200] if loc else None,
+                "interesting": body_hit or loc_hit,
+            })
+    return {
+        "url": url,
+        "evil_host": evil_host,
+        "findings": findings,
+        "vulnerable": any(f.get("interesting") for f in findings),
+    }
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=60.0,
+)
+async def subdomain_takeover_check(domain: str) -> dict:
+    """Check a hostname for dangling CNAME / common takeover fingerprints.
+
+    Args:
+        domain: Hostname to check (e.g. docs.example.com).
+    """
+    resolver = dns.asyncresolver.Resolver()
+    resolver.lifetime = 8.0
+    result: dict = {"domain": domain, "cname": [], "a": [], "signals": []}
+    try:
+        ans = await resolver.resolve(domain, "CNAME")
+        result["cname"] = [r.to_text().rstrip(".") for r in ans]
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.DNSException) as e:
+        result["cname_error"] = str(e)
+    try:
+        ans = await resolver.resolve(domain, "A")
+        result["a"] = [r.to_text() for r in ans]
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.exception.DNSException):
+        pass
+
+    fingerprints = {
+        "github": ["There isn't a GitHub Pages site here", "For root URLs"],
+        "heroku": ["No such app", "no-such-app"],
+        "aws_s3": ["NoSuchBucket", "The specified bucket does not exist"],
+        "azure": ["404 Web Site not found"],
+        "shopify": ["Sorry, this shop is currently unavailable"],
+        "pantheon": ["404 error unknown site"],
+        "fastly": ["Fastly error: unknown domain"],
+    }
+    async with httpx.AsyncClient(
+        timeout=10.0, verify=False, headers={"User-Agent": UA}, follow_redirects=True,
+    ) as client:
+        for scheme in ("https", "http"):
+            try:
+                r = await client.get(f"{scheme}://{domain}/")
+            except httpx.HTTPError:
+                continue
+            body = r.text[:8000]
+            result["http_status"] = r.status_code
+            for vendor, needles in fingerprints.items():
+                if any(n.lower() in body.lower() for n in needles):
+                    result["signals"].append(vendor)
+            break
+
+    dangling = bool(result["cname"]) and not result["a"]
+    result["dangling_cname"] = dangling
+    result["vulnerable"] = dangling or bool(result["signals"])
+    return result
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=45.0,
+)
+async def cloud_bucket_probe(name: str) -> dict:
+    """Probe common public cloud bucket URL patterns for a name.
+
+    Args:
+        name: Bucket / project name guess (e.g. company-assets).
+    """
+    candidates = [
+        f"https://{name}.s3.amazonaws.com/",
+        f"https://{name}.s3-us-west-2.amazonaws.com/",
+        f"https://{name}.storage.googleapis.com/",
+        f"https://{name}.blob.core.windows.net/",
+        f"https://storage.googleapis.com/{name}/",
+    ]
+    hits = []
+    async with httpx.AsyncClient(
+        timeout=10.0, verify=False, headers={"User-Agent": UA}, follow_redirects=False,
+    ) as client:
+        for u in candidates:
+            try:
+                r = await client.get(u)
+            except httpx.HTTPError as e:
+                hits.append({"url": u, "error": str(e)})
+                continue
+            listing = "<ListBucketResult" in r.text or "BlobPrefix" in r.text
+            hits.append({
+                "url": u,
+                "status": r.status_code,
+                "size": len(r.content),
+                "listing_hint": listing,
+                "interesting": r.status_code in (200, 403) or listing,
+            })
+    return {
+        "name": name,
+        "hits": hits,
+        "open_listing": any(h.get("listing_hint") for h in hits),
+    }
+
+
+@mcp.tool(
+    tags={"scan", "active"},
+    annotations={"openWorldHint": True},
+    timeout=90.0,
+)
+async def graphql_deep(
+    url: str,
+    auth_headers: dict[str, str] | None = None,
+) -> dict:
+    """Deeper GraphQL checks: batching, field suggestions, alias abuse, authz differential.
+
+    Args:
+        url: GraphQL endpoint.
+        auth_headers: Optional auth headers for differential comparison.
+    """
+    result: dict = {"url": url}
+    headers = {"Content-Type": "application/json", "User-Agent": UA}
+    async with httpx.AsyncClient(
+        timeout=15.0, verify=False, headers=headers, follow_redirects=False,
+    ) as client:
+        # Field suggestion leakage
+        try:
+            r = await client.post(url, json={"query": "{ __typenameX }"})
+            errs = []
+            try:
+                errs = [e.get("message", "") for e in (r.json().get("errors") or [])]
+            except ValueError:
+                pass
+            result["field_suggestion"] = any("Did you mean" in m for m in errs)
+            result["suggestion_errors"] = errs[:5]
+        except httpx.HTTPError as e:
+            result["suggestion_error"] = str(e)
+
+        # Batch array
+        try:
+            batch = [
+                {"query": "{ __typename }"},
+                {"query": "{ __typename }"},
+                {"query": "{ __typename }"},
+            ]
+            r = await client.post(url, json=batch)
+            result["batch_status"] = r.status_code
+            try:
+                data = r.json()
+                result["batch_accepted"] = isinstance(data, list) and len(data) >= 2
+            except ValueError:
+                result["batch_accepted"] = False
+                result["batch_preview"] = truncate(r.text, 300)
+        except httpx.HTTPError as e:
+            result["batch_error"] = str(e)
+
+        # Alias amplification
+        alias_q = "{" + " ".join(f"a{i}: __typename" for i in range(20)) + "}"
+        try:
+            r = await client.post(url, json={"query": alias_q})
+            result["alias_status"] = r.status_code
+            result["alias_ok"] = r.status_code == 200 and "__typename" in r.text
+        except httpx.HTTPError as e:
+            result["alias_error"] = str(e)
+
+        # Authz differential on a common sensitive field guess
+        sensitive = "{ __schema { queryType { name } } }"
+        try:
+            r_anon = await client.post(url, json={"query": sensitive})
+            result["anon_introspection_status"] = r_anon.status_code
+            result["anon_has_schema"] = "__schema" in r_anon.text
+            if auth_headers:
+                r_auth = await client.post(
+                    url, json={"query": sensitive}, headers={**headers, **auth_headers}
+                )
+                result["auth_introspection_status"] = r_auth.status_code
+                result["auth_has_schema"] = "__schema" in r_auth.text
+                result["authz_diff"] = (
+                    result["anon_has_schema"] != result["auth_has_schema"]
+                )
+        except httpx.HTTPError as e:
+            result["authz_error"] = str(e)
+
+    result["interesting"] = bool(
+        result.get("field_suggestion")
+        or result.get("batch_accepted")
+        or result.get("anon_has_schema")
+    )
     return result
 

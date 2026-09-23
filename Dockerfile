@@ -30,6 +30,18 @@ RUN apt-get update \
         unzip \
     && rm -rf /var/lib/apt/lists/*
 
+# dbmate for schema migrations (.migration/)
+RUN set -eux; \
+    ARCH="$(uname -m)"; \
+    case "$ARCH" in \
+      x86_64) DBMATE_ARCH=amd64 ;; \
+      aarch64|arm64) DBMATE_ARCH=arm64 ;; \
+      *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/dbmate \
+      "https://github.com/amacneil/dbmate/releases/download/v2.36.0/dbmate-linux-${DBMATE_ARCH}"; \
+    chmod +x /usr/local/bin/dbmate
+
 # ProjectDiscovery binaries (subfinder + nuclei) from GitHub releases.
 # Asset names include the version, so resolve via the releases API.
 RUN set -eux; \
@@ -61,6 +73,10 @@ print(matches[0])" "$PD_ARCH" "$name")"; \
     }; \
     download_pd subfinder; \
     download_pd nuclei; \
+    download_pd httpx; \
+    download_pd katana; \
+    download_pd naabu; \
+    download_pd dnsx; \
     apt-get purge -y unzip; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*
@@ -79,6 +95,7 @@ WORKDIR /app
 
 COPY --from=builder --chown=pwnmcp:pwnmcp /app/.venv /app/.venv
 COPY --chown=pwnmcp:pwnmcp scope.example.txt ./
+COPY --chown=pwnmcp:pwnmcp .migration /app/.migration
 COPY --chmod=755 docker/entrypoint.sh /entrypoint.sh
 
 ENV PATH="/app/.venv/bin:$PATH" \
@@ -88,6 +105,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PWN_MCP_HOST=0.0.0.0 \
     PWN_MCP_PORT=8000 \
     PWN_MCP_UPDATE_NUCLEI_TEMPLATES=true \
+    DBMATE_MIGRATIONS_DIR=/app/.migration \
     HOME=/home/pwnmcp
 
 USER pwnmcp

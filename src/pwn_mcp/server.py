@@ -18,6 +18,8 @@ from .middleware import ScopeEnforcementMiddleware
 from .proxy_server import proxy_manager
 from .scope import load_scope
 from .servers.crypto import mcp as crypto_mcp
+from .servers.jobs import mcp as jobs_mcp
+from .servers.playbook import mcp as playbook_mcp
 from .servers.proxy import mcp as proxy_mcp
 from .servers.recon import mcp as recon_mcp
 from .servers.scan import mcp as scan_mcp
@@ -42,19 +44,36 @@ def _auth_from_env() -> StaticTokenVerifier | None:
     )
 
 
+_STACK_BUG_MAP = (
+    "Stack→bug hints: Rails/Laravel/Django→IDOR/mass-assignment; Flask→SSTI/SSRF; "
+    "Express→prototype pollution; Spring→actuators; Next.js→server-action SSRF; "
+    "GraphQL→introspection/mutation authz; WordPress→plugins/REST. "
+    "See recon_tech_fingerprint.stack_bug_hints."
+)
+
 mcp = FastMCP(
     "pwn-mcp",
     instructions=(
-        "Security testing toolkit for web applications, APIs, and SPAs "
-        "(CTF, VDP, authorized internal testing). Tool namespaces: "
-        "recon_* for HTTP/DNS/TLS/WebSocket reconnaissance, JS bundle and "
-        "API-doc discovery, crypto_* for encoding and JWT/hash utilities, "
-        "scan_* for port/dir/subdomain scanning, optional nmap/subfinder/"
-        "nuclei wrappers (list tags/templates then scan), allowlisted "
-        "cli_run for full CLI flags, and vuln probes, "
-        "proxy_* for managing the embedded intercepting proxy and agent traffic telemetry. "
-        "If a scope file is configured, active tools and proxy egress only run against "
-        "in-scope targets. Only use against targets you are authorized to test."
+        "Security testing toolkit for web/API/SPA (CTF, VDP, authorized testing). "
+        "Namespaces: recon_* (HTTP/DNS/TLS/WS/JS/API/session/secrets/url_triage), "
+        "crypto_* (encode/JWT/jwt_attack/hash + hash_crack_enqueue), "
+        "scan_* (ports/dirs/vuln probes + PD wrappers + ssrf/idor/cache/host/"
+        "takeover/buckets/graphql_deep + nmap/subfinder/nuclei/cli_run), "
+        "proxy_* (history, intercept/resume, replay, match_replace, export_har/burp), "
+        "jobs_* (background long scans — use when nuclei/nmap/cli_run/hashcat would "
+        "exceed tool timeouts; poll jobs_status/jobs_result; kinds include "
+        "cli_run, nuclei_scan, nmap_scan, subfinder_enum, monitor_subs, hash_crack), "
+        "playbook_* (recon_surface, api_pass, xss_pass, web2_recon — returns summaries "
+        "+ job ids for the agent to poll). "
+        "Prefer typed tools; use scan_cli_run for full CLI flags on the allowlist "
+        "(nuclei,subfinder,nmap,whois,dig,httpx,katana,naabu,dnsx,ffuf,assetfinder). "
+        "For nuclei: scan_nuclei_list_tags → list_templates → scan or jobs_start. "
+        "Agent owns session memory; MCP does not store recon notepads. "
+        "5-minute kill signals: only 403/static pages, no APIs/JS endpoints, empty "
+        "nuclei — move on. "
+        f"{_STACK_BUG_MAP} "
+        "If a scope file is configured, active tools only run in-scope. "
+        "Only use against targets you are authorized to test."
     ),
     version="0.1.0",
     auth=_auth_from_env(),
@@ -64,6 +83,8 @@ mcp.mount(recon_mcp, namespace="recon")
 mcp.mount(crypto_mcp, namespace="crypto")
 mcp.mount(scan_mcp, namespace="scan")
 mcp.mount(proxy_mcp, namespace="proxy")
+mcp.mount(jobs_mcp, namespace="jobs")
+mcp.mount(playbook_mcp, namespace="playbook")
 
 mcp.add_middleware(ScopeEnforcementMiddleware(active_scope))
 
