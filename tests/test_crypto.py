@@ -1,6 +1,10 @@
 """Tests for the crypto_* tools — all deterministic, no network."""
 
+import base64
+
 import pytest
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from fastmcp import Client
 
 
@@ -68,6 +72,56 @@ async def test_jwt_sign_none_alg(mcp_client: Client):
     r = await mcp_client.call_tool("crypto_jwt_sign", {
         "payload": {"sub": "x"}, "alg": "none"})
     assert r.data.endswith(".")
+
+
+async def test_jwt_sign_rs256(mcp_client: Client):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    r = await mcp_client.call_tool("crypto_jwt_sign", {
+        "payload": {"sub": "cloud-admin"},
+        "alg": "RS256",
+        "private_key_pem": pem,
+    })
+    header_b64, payload_b64, sig_b64 = r.data.split(".")
+    decoded = await mcp_client.call_tool("crypto_jwt_decode", {"token": r.data})
+    assert decoded.data["header"]["alg"] == "RS256"
+    assert decoded.data["payload"]["sub"] == "cloud-admin"
+    pad = "=" * ((4 - len(sig_b64) % 4) % 4)
+    sig = base64.urlsafe_b64decode(sig_b64 + pad)
+    key.public_key().verify(
+        sig,
+        f"{header_b64}.{payload_b64}".encode(),
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
+
+
+async def test_jwt_sign_hmac_base64_matches_utf8(mcp_client: Client):
+    raw = await mcp_client.call_tool("crypto_jwt_sign", {
+        "payload": {"sub": "a"}, "secret": "s3cret", "alg": "HS256"})
+    encoded = await mcp_client.call_tool("crypto_jwt_sign", {
+        "payload": {"sub": "a"},
+        "secret": base64.b64encode(b"s3cret").decode(),
+        "alg": "HS256",
+        "secret_encoding": "base64",
+    })
+    assert raw.data == encoded.data
+
+
+async def test_totp_rfc6238(mcp_client: Client):
+    r = await mcp_client.call_tool("crypto_totp", {
+        "secret": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+        "at": 59,
+        "digits": 8,
+        "period": 30,
+    })
+    assert r.data["code"] == "94287082"
+    assert r.data["time"] == 59
+    assert r.data["seconds_remaining"] == 1
 
 
 async def test_transform(mcp_client: Client):

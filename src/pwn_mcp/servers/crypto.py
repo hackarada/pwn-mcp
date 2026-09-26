@@ -15,6 +15,8 @@ import time
 import urllib.parse
 from typing import Literal
 
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
@@ -253,6 +255,32 @@ def jwt_decode(token: str) -> dict:
     }
 
 
+_JwtAlg = Literal["HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "none"]
+_HMAC_DIGESTS = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+_RS_HASHES = {"RS256": hashes.SHA256(), "RS384": hashes.SHA384(), "RS512": hashes.SHA512()}
+_TOTP_DIGESTS = {"sha1": hashlib.sha1, "sha256": hashlib.sha256, "sha512": hashlib.sha512}
+
+
+def _hmac_key(secret: str, secret_encoding: Literal["utf8", "base64"]) -> bytes:
+    if secret_encoding == "utf8":
+        return secret.encode()
+    try:
+        return base64.b64decode(secret, validate=True)
+    except binascii.Error as exc:
+        raise ToolError(f"secret is not valid base64: {exc}") from exc
+
+
+def _rs_sign(signing_input: bytes, private_key_pem: str, alg: str) -> bytes:
+    try:
+        key = serialization.load_pem_private_key(private_key_pem.encode(), password=None)
+    except (ValueError, TypeError) as exc:
+        raise ToolError(f"Invalid private key PEM: {exc}") from exc
+    try:
+        return key.sign(signing_input, padding.PKCS1v15(), _RS_HASHES[alg])
+    except (TypeError, ValueError) as exc:
+        raise ToolError(f"{alg} signing failed: {exc}") from exc
+
+
 @mcp.tool(
     tags={"crypto"},
     annotations={"readOnlyHint": True, "openWorldHint": False},
@@ -260,16 +288,26 @@ def jwt_decode(token: str) -> dict:
 def jwt_sign(
     payload: dict,
     secret: str = "",
-    alg: Literal["HS256", "HS384", "HS512", "none"] = "HS256",
+    alg: _JwtAlg = "HS256",
     header_extra: dict | None = None,
+    private_key_pem: str | None = None,
+    secret_encoding: Literal["utf8", "base64"] = "utf8",
 ) -> str:
-    """Forge a JWT with a supplied secret — for weak-secret and alg=none tests.
+    """Forge a JWT for weak-secret, alg=none, HMAC, or RSA tests.
+
+    HMAC algs sign with ``secret``. ``secret_encoding=base64`` uses the
+    decoded bytes as the HMAC key, which keeps a PEM or other binary key
+    intact when a text secret would change newlines. RS256, RS384, and
+    RS512 sign with ``private_key_pem`` (unencrypted PKCS8 or traditional
+    OpenSSL PEM).
 
     Args:
         payload: Claims dict for the token body.
-        secret: HMAC secret (ignored for alg=none).
-        alg: HS256, HS384, HS512, or none.
+        secret: HMAC secret (ignored for alg=none and RS*).
+        alg: HS256, HS384, HS512, RS256, RS384, RS512, or none.
         header_extra: Extra header fields to merge (e.g. kid, jku).
+        private_key_pem: PEM private key for RS256, RS384, or RS512.
+        secret_encoding: utf8, or base64 for a raw HMAC key.
     """
     header = {"alg": alg, "typ": "JWT"}
     if header_extra:
@@ -278,9 +316,71 @@ def jwt_sign(
                     f"{_b64url(json.dumps(payload, separators=(',', ':')).encode())}"
     if alg == "none":
         return signing_input + "."
-    digest = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}[alg]
-    sig = hmac.new(secret.encode(), signing_input.encode(), digest).digest()
+    if alg in _RS_HASHES:
+        if not private_key_pem:
+            raise ToolError(f"{alg} requires private_key_pem")
+        sig = _rs_sign(signing_input.encode(), private_key_pem, alg)
+        return f"{signing_input}.{_b64url(sig)}"
+    digest = _HMAC_DIGESTS[alg]
+    sig = hmac.new(_hmac_key(secret, secret_encoding), signing_input.encode(), digest).digest()
     return f"{signing_input}.{_b64url(sig)}"
+
+
+def _hotp(key: bytes, counter: int, digits: int, digest) -> str:
+    msg = counter.to_bytes(8, "big")
+    mac = hmac.new(key, msg, digest).digest()
+    offset = mac[-1] & 0x0F
+    binary = int.from_bytes(mac[offset:offset + 4], "big") & 0x7FFFFFFF
+    return str(binary % (10 ** digits)).zfill(digits)
+
+
+def _b32_key(secret: str) -> bytes:
+    cleaned = re.sub(r"[\s=]", "", secret).upper()
+    if not cleaned:
+        raise ToolError("secret must not be empty")
+    padded = cleaned + ("=" * ((8 - len(cleaned) % 8) % 8))
+    try:
+        return base64.b32decode(padded, casefold=True)
+    except binascii.Error as exc:
+        raise ToolError(f"Invalid base32 secret: {exc}") from exc
+
+
+@mcp.tool(
+    tags={"crypto"},
+    annotations={"readOnlyHint": True, "openWorldHint": False},
+)
+def totp(
+    secret: str,
+    at: int | None = None,
+    digits: int = 6,
+    period: int = 30,
+    algorithm: Literal["sha1", "sha256", "sha512"] = "sha1",
+) -> dict:
+    """Return a fresh TOTP code for a base32 secret.
+
+    Call this in the same turn as the verify request. A code from an earlier
+    turn can already be outside the acceptance window.
+
+    Args:
+        secret: Base32 TOTP secret (spaces are ignored).
+        at: Unix time to use. Omit for the current time.
+        digits: 6, 7, or 8.
+        period: Step length in seconds (1 to 300).
+        algorithm: sha1 (the usual authenticator default), sha256, or sha512.
+    """
+    if digits not in (6, 7, 8):
+        raise ToolError("digits must be 6, 7, or 8")
+    if period < 1 or period > 300:
+        raise ToolError("period must be between 1 and 300")
+    when = int(time.time()) if at is None else int(at)
+    code = _hotp(_b32_key(secret), when // period, digits, _TOTP_DIGESTS[algorithm])
+    remaining = period - (when % period)
+    return {
+        "code": code,
+        "time": when,
+        "period": period,
+        "seconds_remaining": remaining,
+    }
 
 
 @mcp.tool(

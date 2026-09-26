@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import re
 import socket
@@ -19,13 +20,18 @@ from fastmcp.exceptions import ToolError
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import WebSocketException
 
+from ..http_observe import baseline_from, classify, html_title, preview, project_json
 from ..scope import load_scope
-from ..util import run_cmd, target_host, truncate, which
+from ..util import MAX_BODY_CHARS, run_cmd, target_host, truncate, which
 
 mcp = FastMCP("recon")
 
 UA = "pwn-mcp/0.1 (security testing)"
 _TIMEOUT = httpx.Timeout(15.0, connect=8.0)
+_BATCH_MAX = 10
+_MULTIPART_MAX = 2_000_000
+_BODY_LIMIT_MAX = 100_000
+_WS_STEP_MAX = 20
 
 
 def _client(verify_tls: bool = False, follow_redirects: bool = True) -> httpx.AsyncClient:
@@ -35,6 +41,59 @@ def _client(verify_tls: bool = False, follow_redirects: bool = True) -> httpx.As
         follow_redirects=follow_redirects,
         headers={"User-Agent": UA},
     )
+
+
+def _body_limit(body_limit: int | None) -> int:
+    if body_limit is None:
+        return MAX_BODY_CHARS
+    limit = int(body_limit)
+    if limit < 1 or limit > _BODY_LIMIT_MAX:
+        raise ToolError(f"body_limit must be between 1 and {_BODY_LIMIT_MAX}")
+    return limit
+
+
+def _multipart_files(parts: list[dict]) -> list[tuple]:
+    """Build httpx file tuples. ``size`` pads ``content`` with A up to that many bytes."""
+    if not parts:
+        raise ToolError("multipart must contain at least one part")
+    files: list[tuple] = []
+    for index, part in enumerate(parts):
+        if not isinstance(part, dict):
+            raise ToolError(f"multipart[{index}] must be an object")
+        name = part.get("name")
+        if not isinstance(name, str) or not name:
+            raise ToolError(f"multipart[{index}] needs a name")
+        content = part.get("content") or ""
+        if not isinstance(content, str):
+            raise ToolError(f"multipart[{index}].content must be a string")
+        raw = content.encode()
+        if part.get("size") is not None:
+            size = int(part["size"])
+            if size < 0 or size > _MULTIPART_MAX:
+                raise ToolError(
+                    f"multipart size must be between 0 and {_MULTIPART_MAX}"
+                )
+            if len(raw) < size:
+                raw = raw + (b"A" * (size - len(raw)))
+            else:
+                raw = raw[:size]
+        elif len(raw) > _MULTIPART_MAX:
+            raise ToolError(f"multipart content exceeds {_MULTIPART_MAX} bytes")
+        filename = part.get("filename")
+        if filename is not None and not isinstance(filename, str):
+            raise ToolError(f"multipart[{index}].filename must be a string")
+        content_type = part.get("content_type") or "application/octet-stream"
+        if filename:
+            files.append((name, (filename, raw, str(content_type))))
+        else:
+            files.append((name, (None, raw.decode("utf-8", "replace"))))
+    return files
+
+
+def _drop_content_type(headers: dict[str, str] | None) -> dict[str, str] | None:
+    if not headers:
+        return headers
+    return {key: value for key, value in headers.items() if key.lower() != "content-type"}
 
 
 @mcp.tool(
@@ -48,10 +107,28 @@ async def http_request(
     headers: dict[str, str] | None = None,
     body: str | None = None,
     params: dict[str, str] | None = None,
+    fields: list[str] | None = None,
+    multipart: list[dict] | None = None,
+    body_limit: int | None = None,
     verify_tls: bool = False,
     follow_redirects: bool = True,
 ) -> dict:
     """Send an arbitrary HTTP request and inspect the response.
+
+    This tool does not store cookies or tokens. When a JSON body contains a
+    token, send it on the next call yourself: ``Authorization: Bearer <token>``
+    and ``Cookie: token=<token>``. Some APIs ignore the header and read only
+    the cookie.
+
+    ``fields`` projects a JSON body before truncation. ``data[].name`` keeps
+    ``name`` on each object in ``data``. Use it when ``body`` ends with a
+    truncation note and you need a few keys from a large document.
+
+    ``multipart`` builds a multipart body. Each part has ``name``, and
+    optionally ``filename``, ``content``, ``content_type``, and ``size``.
+    ``size`` is the exact byte length: ``content`` is padded with ``A`` or
+    trimmed to fit, so a large file upload does not have to be pasted in.
+    Do not send ``body`` and ``multipart`` together.
 
     Args:
         url: Full target URL, e.g. https://example.com/api/login.
@@ -59,26 +136,131 @@ async def http_request(
         headers: Request headers to send.
         body: Raw request body.
         params: Query parameters.
+        fields: JSON paths to keep. ``[]`` walks a list (``data[].solved``).
+        multipart: File or form parts. ``size`` pads with A up to 2000000 bytes.
+        body_limit: Response characters to keep (default 8000, max 100000).
         verify_tls: Verify TLS certificates (default False for testing).
         follow_redirects: Follow 3xx redirects.
     """
+    if body is not None and multipart:
+        raise ToolError("pass body or multipart, not both")
+    limit = _body_limit(body_limit)
+    files = _multipart_files(multipart) if multipart else None
+    request_headers = _drop_content_type(headers) if files else headers
     async with _client(verify_tls, follow_redirects) as client:
         try:
             resp = await client.request(
-                method.upper(), url, headers=headers, content=body, params=params
+                method.upper(),
+                url,
+                headers=request_headers,
+                content=None if files else body,
+                files=files,
+                params=params,
             )
         except httpx.HTTPError as e:
             raise ToolError(f"Request failed: {e}")
-    return {
+    text = resp.text
+    result = {
         "status": resp.status_code,
         "reason": resp.reason_phrase,
         "url": str(resp.url),
         "headers": dict(resp.headers),
         "redirects": [str(r.url) for r in resp.history],
         "elapsed_ms": round(resp.elapsed.total_seconds() * 1000),
-        "body": truncate(resp.text),
         "body_length": len(resp.content),
     }
+    if fields:
+        try:
+            projected = project_json(json.loads(resp.text), fields)
+        except json.JSONDecodeError:
+            result["fields_applied"] = False
+            result["fields_error"] = "response body is not JSON"
+        else:
+            text = json.dumps(projected, separators=(",", ":"))
+            result["fields_applied"] = True
+    result["body"] = truncate(text, limit)
+    return result
+
+
+@mcp.tool(
+    tags={"recon", "active"},
+    annotations={"openWorldHint": True},
+    timeout=45.0,
+)
+async def http_batch(
+    requests: list[dict],
+    verify_tls: bool = False,
+    follow_redirects: bool = True,
+) -> dict:
+    """Send up to 10 HTTP requests at the same time.
+
+    Use this when the requests must overlap, such as a double-submit or a
+    like race. One ``recon_http_request`` after another does not overlap.
+    Each item needs ``url`` and may set ``method``, ``headers``, ``body``,
+    and ``params``. Results stay in input order. Each request URL is
+    scope-checked.
+
+    Args:
+        requests: 1 to 10 request objects.
+        verify_tls: Verify TLS certificates (default False for testing).
+        follow_redirects: Follow 3xx redirects.
+    """
+    if not isinstance(requests, list) or not requests:
+        raise ToolError("requests must be a non-empty list")
+    if len(requests) > _BATCH_MAX:
+        raise ToolError(f"at most {_BATCH_MAX} requests")
+    calls: list[dict] = []
+    for index, req in enumerate(requests):
+        url = req.get("url") if isinstance(req, dict) else None
+        if not isinstance(url, str) or not url.strip():
+            raise ToolError(f"requests[{index}] needs a url")
+        method = req.get("method") or "GET"
+        if not isinstance(method, str):
+            raise ToolError(f"requests[{index}].method must be a string")
+        req_headers = req.get("headers")
+        if req_headers is not None and not isinstance(req_headers, dict):
+            raise ToolError(f"requests[{index}].headers must be an object")
+        req_body = req.get("body")
+        if req_body is not None and not isinstance(req_body, str):
+            raise ToolError(f"requests[{index}].body must be a string")
+        req_params = req.get("params")
+        if req_params is not None and not isinstance(req_params, dict):
+            raise ToolError(f"requests[{index}].params must be an object")
+        calls.append({
+            "url": url,
+            "method": method,
+            "headers": req_headers,
+            "body": req_body,
+            "params": req_params,
+        })
+
+    results: list[dict | None] = [None] * len(calls)
+
+    async def one(index: int, req: dict) -> None:
+        try:
+            response = await client.request(
+                req["method"].upper(),
+                req["url"],
+                headers=req["headers"],
+                content=req["body"],
+                params=req["params"],
+            )
+        except httpx.HTTPError as exc:
+            results[index] = {"index": index, "url": req["url"], "error": str(exc)}
+            return
+        results[index] = {
+            "index": index,
+            "status": response.status_code,
+            "reason": response.reason_phrase,
+            "url": str(response.url),
+            "elapsed_ms": round(response.elapsed.total_seconds() * 1000),
+            "body_length": len(response.content),
+            "body": truncate(response.text, 2000),
+        }
+
+    async with _client(verify_tls, follow_redirects) as client:
+        await asyncio.gather(*(one(index, req) for index, req in enumerate(calls)))
+    return {"count": len(calls), "results": results}
 
 
 _SECURITY_HEADERS = {
@@ -192,7 +374,7 @@ _BODY_MARKERS = {
     "WordPress": [r"wp-content", r"wp-includes"],
     "Next.js": [r"/_next/", r"__NEXT_DATA__"],
     "React": [r"data-reactroot", r"react-dom"],
-    "Angular": [r"ng-app", r"ng-version"],
+    "Angular": [r"ng-app", r"ng-version", r"<app-root\b", r"data-beasties-container"],
     "Vue.js": [r"data-v-", r"__VUE__"],
     "jQuery": [r"jquery[.-]?\d", r"jQuery"],
     "Laravel": [r"laravel_session", r"csrf-token"],
@@ -243,6 +425,8 @@ async def tech_fingerprint(url: str) -> dict:
     return {
         "url": str(resp.url),
         "status": resp.status_code,
+        "title": html_title(body),
+        "content_type": resp.headers.get("content-type", ""),
         "detected": detected,
         "stack_bug_hints": stack_bugs,
     }
@@ -625,6 +809,9 @@ _API_DOC_PATHS = [
 async def api_discover(url: str, extra_paths: list[str] | None = None) -> dict:
     """Probe a host for exposed API documentation, schemas, and spec endpoints.
 
+    Responses that are the same document as the site index are returned in
+    ``spa_shells``, not ``found``. A catch-all HTML 200 is not an API document.
+
     Args:
         url: Base URL, e.g. https://api.example.com.
         extra_paths: Additional paths to probe.
@@ -632,23 +819,202 @@ async def api_discover(url: str, extra_paths: list[str] | None = None) -> dict:
     base = url.rstrip("/")
     paths = _API_DOC_PATHS + [p for p in (extra_paths or [])]
     found = []
+    spa_shells = []
     async with _client(follow_redirects=False) as client:
+        baseline = await _index_baseline(client, base)
         for path in paths:
             try:
                 r = await client.get(f"{base}{path}")
             except httpx.HTTPError:
                 continue
-            if r.status_code != 404:
-                entry = {
-                    "path": path,
-                    "status": r.status_code,
-                    "content_type": r.headers.get("content-type", ""),
-                    "size": len(r.content),
-                }
-                if r.status_code == 200 and "json" in entry["content_type"]:
-                    entry["preview"] = r.text[:500]
+            if r.status_code == 404:
+                continue
+            entry = _observed(path, r, baseline)
+            if entry["kind"] == "spa_shell":
+                spa_shells.append(entry)
+            else:
                 found.append(entry)
-    return {"base": base, "found": found, "probed": len(paths)}
+    return {
+        "base": base,
+        "found": found,
+        "spa_shells": spa_shells,
+        "probed": len(paths),
+    }
+
+
+def _observed(path: str, response: httpx.Response, baseline: dict | None) -> dict:
+    content_type = response.headers.get("content-type", "")
+    kind = classify(
+        status=response.status_code,
+        content_type=content_type,
+        body=response.text,
+        baseline=baseline,
+    )
+    entry = {
+        "path": path if path.startswith("/") else "/" + path,
+        "status": response.status_code,
+        "content_type": content_type,
+        "size": len(response.content),
+        "kind": kind,
+    }
+    title = html_title(response.text)
+    if title and kind != "spa_shell":
+        entry["title"] = title
+    if kind == "json":
+        entry["preview"] = preview(response.text, 500)
+    elif kind == "directory_listing":
+        hrefs = re.findall(r"""href=["']([^"'#?]+)["']""", response.text, re.IGNORECASE)
+        entry["entries"] = [href for href in hrefs if href not in ("/", ".", "..")][:40]
+    return entry
+
+
+async def _index_baseline(client: httpx.AsyncClient, base: str) -> dict | None:
+    try:
+        index = await client.get(base if base.endswith("/") else base + "/")
+    except httpx.HTTPError:
+        return None
+    if index.status_code != 200:
+        return None
+    return baseline_from(index.text)
+
+
+def _same_origin_path(base: str, raw: str) -> str | None:
+    """Return a path on *base*, or None when *raw* points at another host."""
+    text = raw.strip()
+    if not text or text.startswith("//"):
+        return None
+    if "://" in text:
+        parsed = urlparse(text)
+        base_host = urlparse(base).netloc
+        if parsed.netloc.lower() != base_host.lower():
+            return None
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        return path
+    if not text.startswith("/"):
+        text = "/" + text
+    return text
+
+
+@mcp.tool(
+    tags={"recon", "active"},
+    annotations={"openWorldHint": True},
+    timeout=60.0,
+)
+async def probe_paths(url: str, paths: list[str], limit: int = 40) -> dict:
+    """GET specific paths and label each response.
+
+    Use this after robots.txt, a crawl, or ``js_analyze`` to see which of
+    those paths are real documents. ``kind`` is ``spa_shell`` when the body
+    matches the site index, ``json`` for a JSON body, ``directory_listing``
+    for an index page, and ``html`` / ``text`` / ``error`` otherwise.
+
+    The tool does not rank or drop paths. The caller decides what to request
+    next. Paths on a different host are skipped.
+
+    Args:
+        url: Base URL, e.g. https://app.example/.
+        paths: Relative paths or same-host absolute URLs.
+        limit: Max paths to request (default 40, capped at 60).
+    """
+    base = url.rstrip("/")
+    cap = max(1, min(int(limit), 60))
+    selected: list[str] = []
+    skipped_other_host: list[str] = []
+    for raw in paths:
+        if not isinstance(raw, str):
+            continue
+        path = _same_origin_path(base, raw)
+        if path is None:
+            skipped_other_host.append(raw)
+            continue
+        if path not in selected:
+            selected.append(path)
+        if len(selected) >= cap:
+            break
+
+    results: list[dict] = []
+    async with _client(follow_redirects=False) as client:
+        baseline = await _index_baseline(client, base)
+        sem = asyncio.Semaphore(10)
+
+        async def one(path: str) -> None:
+            async with sem:
+                try:
+                    response = await client.get(f"{base}{path}")
+                except httpx.HTTPError as exc:
+                    results.append({"path": path, "error": str(exc)})
+                    return
+            entry = _observed(path, response, baseline)
+            if entry["kind"] not in ("spa_shell", "json", "directory_listing"):
+                entry["preview"] = preview(response.text, 240)
+            results.append(entry)
+
+        await asyncio.gather(*(one(path) for path in selected))
+
+    results.sort(key=lambda item: item.get("path", ""))
+    return {
+        "base": base,
+        "tested": len(selected),
+        "skipped_other_host": skipped_other_host[:20],
+        "results": results,
+    }
+
+
+def _ws_record(frame: str | bytes, text: str) -> dict:
+    if isinstance(frame, bytes):
+        return {"type": "binary", "size": len(frame), "data": truncate(text)}
+    return {"type": "text", "size": len(frame), "data": truncate(text)}
+
+
+def _validate_ws_steps(steps: list) -> None:
+    if len(steps) > _WS_STEP_MAX:
+        raise ToolError(f"at most {_WS_STEP_MAX} websocket steps")
+    for step in steps:
+        if not isinstance(step, dict):
+            raise ToolError("each websocket step must be an object")
+        has_send = "send" in step
+        has_wait = "wait_prefix" in step
+        if has_send == has_wait:
+            raise ToolError("each websocket step needs exactly one of send or wait_prefix")
+        if has_send and not isinstance(step["send"], str):
+            raise ToolError("send must be a string")
+        if has_wait and not isinstance(step["wait_prefix"], str):
+            raise ToolError("wait_prefix must be a string")
+
+
+async def _run_ws_steps(
+    ws,
+    steps: list[dict],
+    sent: list[str],
+    received: list[dict],
+    max_messages: int,
+    recv_timeout: float,
+) -> list[dict]:
+    script: list[dict] = []
+    for step in steps:
+        if "send" in step:
+            message = step["send"]
+            await ws.send(message)
+            sent.append(message)
+            script.append({"send": message})
+            continue
+        prefix = step["wait_prefix"]
+        timeout = float(step.get("timeout", recv_timeout))
+        matched = False
+        while len(received) < max_messages:
+            try:
+                frame = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            except TimeoutError:
+                break
+            text = frame.decode("utf-8", "replace") if isinstance(frame, bytes) else frame
+            received.append(_ws_record(frame, text))
+            if text.startswith(prefix):
+                matched = True
+                break
+        script.append({"wait_prefix": prefix, "matched": matched})
+    return script
 
 
 @mcp.tool(
@@ -659,6 +1025,7 @@ async def api_discover(url: str, extra_paths: list[str] | None = None) -> dict:
 async def websocket_probe(
     url: str,
     messages: list[str] | None = None,
+    steps: list[dict] | None = None,
     headers: dict[str, str] | None = None,
     subprotocols: list[str] | None = None,
     max_messages: int = 10,
@@ -668,9 +1035,17 @@ async def websocket_probe(
 ) -> dict:
     """Connect to a WebSocket endpoint, optionally send messages, and capture replies.
 
+    ``messages`` sends every frame immediately, then reads. ``steps`` is a
+    script for protocols that must ack before the next frame. Each step is
+    ``{"send": "40"}`` or ``{"wait_prefix": "40", "timeout": 2}``. A wait
+    reads until a frame starts with that prefix. Socket.io: wait for ``0``,
+    send ``40``, wait for ``40``, then send the event. After the script the
+    probe still reads until ``max_messages`` or ``recv_timeout``.
+
     Args:
         url: WebSocket URL, e.g. ws://host/path or wss://host/path.
-        messages: Text frames to send after connect (default: none).
+        messages: Text frames to send immediately after connect (default: none).
+        steps: Ordered send / wait_prefix script. Do not combine with messages.
         headers: Extra handshake headers (Origin, Authorization, cookies, ...).
         subprotocols: Optional Sec-WebSocket-Protocol values.
         max_messages: Max frames to collect (sent echoes + unsolicited).
@@ -693,9 +1068,15 @@ async def websocket_probe(
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
 
+    if steps and messages:
+        raise ToolError("pass steps or messages, not both")
+    if steps:
+        _validate_ws_steps(steps)
+
     sent: list[str] = []
     received: list[dict] = []
     negotiated: str | None = None
+    script: list[dict] | None = None
 
     try:
         async with ws_connect(
@@ -708,30 +1089,25 @@ async def websocket_probe(
             ssl=ssl_ctx,
         ) as ws:
             negotiated = ws.subprotocol
-            for msg in messages or []:
-                await ws.send(msg)
-                sent.append(msg)
+            if steps:
+                script = await _run_ws_steps(
+                    ws, steps, sent, received, max_messages, recv_timeout,
+                )
+            else:
+                for msg in messages or []:
+                    await ws.send(msg)
+                    sent.append(msg)
             while len(received) < max_messages:
                 try:
                     frame = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
                 except TimeoutError:
                     break
-                if isinstance(frame, bytes):
-                    received.append({
-                        "type": "binary",
-                        "size": len(frame),
-                        "data": truncate(frame.decode("utf-8", "replace")),
-                    })
-                else:
-                    received.append({
-                        "type": "text",
-                        "size": len(frame),
-                        "data": truncate(frame),
-                    })
+                text = frame.decode("utf-8", "replace") if isinstance(frame, bytes) else frame
+                received.append(_ws_record(frame, text))
     except (WebSocketException, OSError, TimeoutError) as e:
         raise ToolError(f"WebSocket probe failed: {e}") from e
 
-    return {
+    result = {
         "url": url,
         "connected": True,
         "subprotocol": negotiated,
@@ -739,6 +1115,9 @@ async def websocket_probe(
         "received": received,
         "received_count": len(received),
     }
+    if script is not None:
+        result["script"] = script
+    return result
 
 
 @mcp.tool(

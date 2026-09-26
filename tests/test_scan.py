@@ -73,6 +73,17 @@ async def test_reflected_xss_probe(mcp_client: Client, http_server: str):
     assert r.data["reflected"] is True
     assert r.data["context"] == "html_text"
     assert r.data["special_chars_unescaped"]["angle"] is True
+    assert r.data["appears_encoded"] is False
+    assert r.data["reflection_in_error"] is False
+
+
+async def test_reflected_xss_probe_encoded_error_page(mcp_client: Client, http_server: str):
+    r = await mcp_client.call_tool("scan_reflected_xss_probe", {
+        "url": f"{http_server}/error_echo", "param": "q"})
+    assert r.data["reflected"] is True
+    assert r.data["special_chars_unescaped"] == {"quote": False, "angle": False}
+    assert r.data["appears_encoded"] is True
+    assert r.data["reflection_in_error"] is True
 
 
 async def test_open_redirect_check(mcp_client: Client, http_server: str):
@@ -119,6 +130,21 @@ async def test_sqli_probe(mcp_client: Client, http_server: str):
         "scan_sqli_probe", {"url": f"{http_server}/sqli", "param": "q"})
     assert r.data["vulnerable"] is True
     assert any(ind["type"] == "error_based" for ind in r.data["indicators"])
+
+
+async def test_sqli_probe_json_auth_differential(mcp_client: Client, http_server: str):
+    r = await mcp_client.call_tool("scan_sqli_probe", {
+        "url": f"{http_server}/login",
+        "param": "email",
+        "method": "POST",
+        "content_type": "json",
+    })
+    assert r.data["content_type"] == "json"
+    assert r.data["baseline_status"] == 401
+    assert r.data["vulnerable"] is True
+    auth = [ind for ind in r.data["indicators"] if ind["type"] == "auth_differential"]
+    assert auth
+    assert "token" in auth[0]["body_preview"]
 
 
 async def test_subfinder_missing_binary(mcp_client: Client, monkeypatch):

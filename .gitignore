@@ -52,3 +52,4 @@ scope.txt
 # Compose overrides that may contain local ports or tokens
 docker-compose.override.yml
 docker-compose.*.override.yml
+test-ag/

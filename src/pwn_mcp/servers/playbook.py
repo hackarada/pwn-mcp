@@ -12,6 +12,7 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
+from ..http_observe import baseline_from, classify
 from ..jobs import enqueue
 from ..util import which
 
@@ -27,7 +28,7 @@ _PLAYBOOKS = {
         "description": "API docs, GraphQL introspection, CORS, security headers",
     },
     "xss_pass": {
-        "description": "Param fuzz + reflected XSS probe on a URL/param",
+        "description": "One GET that checks whether a query param is reflected. Does not run the page.",
     },
     "web2_recon": {
         "description": (
@@ -185,12 +186,22 @@ async def _api_pass(target: str) -> dict:
         api = await _api_paths(client, base)
         steps.append({"step": "api_discover", "result": api})
 
-        gql_url = f"{base}/graphql"
+        gql_url = ""
         for cand in api.get("found", []):
-            if "graphql" in cand.get("path", ""):
+            if "graphql" in cand.get("path", "") and cand.get("kind") == "json":
                 gql_url = f"{base}{cand['path']}"
                 break
-        gql = await _graphql_probe(client, gql_url)
+        if gql_url:
+            gql = await _graphql_probe(client, gql_url)
+        else:
+            shells = [
+                item["path"] for item in api.get("spa_shells", [])
+                if "graphql" in item.get("path", "")
+            ]
+            gql = {
+                "skipped": "no JSON GraphQL document in the doc probe",
+                "spa_shells": shells,
+            }
         steps.append({"step": "graphql_probe", "result": gql})
 
         cors = await _cors(client, base)
@@ -226,6 +237,7 @@ async def _xss_pass(target: str, param: str) -> dict:
             body = r.text
             reflected = canary in body
             raw_angle = f"<script>{canary}</script>" in body
+            encoded_tag = "&lt;script" in body.lower()
         except httpx.HTTPError as e:
             return {
                 "playbook": "xss_pass",
@@ -242,6 +254,8 @@ async def _xss_pass(target: str, param: str) -> dict:
             "result": {
                 "reflected": reflected,
                 "raw_script_tag": raw_angle,
+                "appears_encoded": encoded_tag and not raw_angle,
+                "reflection_in_error": r.status_code >= 500,
                 "status": r.status_code,
                 "probe_url": fuzzed,
             },
@@ -383,18 +397,38 @@ async def _crawl(client: httpx.AsyncClient, base: str) -> dict:
 
 async def _api_paths(client: httpx.AsyncClient, base: str) -> dict:
     found = []
+    spa_shells = []
+    baseline = None
+    try:
+        index = await client.get(base if base.endswith("/") else f"{base}/")
+        if index.status_code == 200:
+            baseline = baseline_from(index.text)
+    except httpx.HTTPError:
+        baseline = None
     for path in _API_DOC_PATHS:
         try:
             r = await client.get(f"{base}{path}")
         except httpx.HTTPError:
             continue
-        if r.status_code != 404:
-            found.append({
-                "path": path,
-                "status": r.status_code,
-                "content_type": r.headers.get("content-type", ""),
-            })
-    return {"found": found, "probed": len(_API_DOC_PATHS)}
+        if r.status_code == 404:
+            continue
+        content_type = r.headers.get("content-type", "")
+        entry = {
+            "path": path,
+            "status": r.status_code,
+            "content_type": content_type,
+            "kind": classify(
+                status=r.status_code,
+                content_type=content_type,
+                body=r.text,
+                baseline=baseline,
+            ),
+        }
+        if entry["kind"] == "spa_shell":
+            spa_shells.append(entry)
+        else:
+            found.append(entry)
+    return {"found": found, "spa_shells": spa_shells, "probed": len(_API_DOC_PATHS)}
 
 
 async def _graphql_probe(client: httpx.AsyncClient, url: str) -> dict:
@@ -403,9 +437,14 @@ async def _graphql_probe(client: httpx.AsyncClient, url: str) -> dict:
         r = await client.post(url, json=query)
         data = r.json() if "json" in r.headers.get("content-type", "") else {}
         schema = (data.get("data") or {}).get("__schema")
+        content_type = r.headers.get("content-type", "")
         return {
             "url": url,
             "status": r.status_code,
+            "content_type": content_type,
+            "response_kind": classify(
+                status=r.status_code, content_type=content_type, body=r.text,
+            ),
             "introspection_enabled": bool(schema),
             "schema": schema,
         }
@@ -461,6 +500,8 @@ def _stack_hints(r: httpx.Response) -> list[str]:
         hints.append("Next.js — SSRF via server actions / open redirect")
     if "wp-content" in body:
         hints.append("WordPress — plugins / REST auth")
+    if "<app-root" in body or "ng-version" in body or "data-beasties-container" in body:
+        hints.append("Angular markers in the HTML")
     if "graphql" in body or "graphql" in str(r.url):
         hints.append("GraphQL — introspection / mutation authz")
     if "asp.net" in powered or "aspnet" in server:
@@ -496,23 +537,42 @@ def _triage_urls(urls: list[str]) -> dict:
 
 
 def _kill_signals(steps: list[dict]) -> list[str]:
-    """Heuristic 5-minute kill / go signals for the agent."""
+    """Factual notes about this batch. The caller decides what to do next."""
     signals: list[str] = []
-    live = []
+    saw_live_probe = False
+    live: list = []
     for s in steps:
+        result = s.get("result") or {}
         if s.get("step") == "live_probe":
-            live = s.get("result", {}).get("live") or []
+            saw_live_probe = True
+            live = result.get("live") or []
         if s.get("step") == "api_discover":
-            found = s.get("result", {}).get("found") or []
-            if not found:
-                signals.append("No API doc endpoints found in quick probe")
-            else:
-                signals.append(f"API surface hints: {len(found)} doc paths responded")
+            found = result.get("found") or []
+            shells = result.get("spa_shells") or []
+            signals.append(
+                f"api_discover: {len(found)} distinct documents, "
+                f"{len(shells)} matched the site index"
+            )
+        if s.get("step") == "js_analyze":
+            bundles = result.get("bundles") or []
+            count = 0
+            if isinstance(bundles, list):
+                count = sum(len(b.get("endpoints") or []) for b in bundles if isinstance(b, dict))
+            elif isinstance(bundles, dict):
+                count = sum(
+                    len((b or {}).get("endpoints") or [])
+                    for b in bundles.values()
+                    if isinstance(b, dict)
+                )
+            signals.append(f"js_analyze: {count} endpoint paths extracted, not requested")
         if s.get("step") == "tech_fingerprint":
-            hints = s.get("result", {}).get("stack_hints") or []
+            title = result.get("title") or ""
+            if title:
+                signals.append(f"title: {title}")
+            hints = result.get("stack_hints") or []
             signals.extend(hints)
-    if live is not None and len(live) == 0:
-        signals.append("KILL?: no live HTTP hosts in sample — consider moving on")
+    if saw_live_probe and not live:
+        signals.append("live_probe: 0 hosts returned HTTP")
     elif live and all(x.get("status") in (403, 401) for x in live):
-        signals.append("Mostly 401/403 on sample — limited unauth surface")
+        signals.append("live_probe: sampled hosts returned 401 or 403")
     return signals

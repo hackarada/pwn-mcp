@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import shutil
 import subprocess
 from urllib.parse import urlparse
@@ -12,10 +13,43 @@ MAX_BODY_CHARS = 8000
 #: Argument names treated as scan/recon targets by scope enforcement.
 TARGET_KEYS = ("url", "host", "target", "domain")
 
+#: Playwright accessibility-tree element refs (e.g. e5, e12).
+_A11Y_REF = re.compile(r"^[a-z]\d+$", re.IGNORECASE)
+#: Single-label hostname / bare word (intranet, router).
+_SINGLE_LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", re.IGNORECASE)
+
 
 def which(binary: str) -> str | None:
     """Return the path to a binary on PATH, or None."""
     return shutil.which(binary)
+
+
+def is_probable_scan_target(value: str) -> bool:
+    """True if *value* looks like a URL/host/IP, not an a11y ref or selector.
+
+    Playwright MCP passes element refs (``e5``) as ``target``; those must not
+    go through scope host checks. Real scan targets (``example.com``,
+    ``https://…``, IPs, ``localhost``) still do.
+    """
+    v = value.strip()
+    if not v:
+        return False
+    if "://" in v:
+        return True
+    if _A11Y_REF.fullmatch(v):
+        return False
+    if v.startswith((".", "#", "[", "/", "(")) or " " in v:
+        return False
+    host = target_host(v)
+    if not host:
+        return False
+    if is_ip(host):
+        return True
+    if host in ("localhost", "localhost.localdomain"):
+        return True
+    if "." in host:
+        return True
+    return bool(_SINGLE_LABEL.fullmatch(host))
 
 
 def run_cmd(args: list[str], timeout: float = 30.0) -> str:

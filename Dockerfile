@@ -81,7 +81,9 @@ print(matches[0])" "$PD_ARCH" "$name")"; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin pwnmcp
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin pwnmcp \
+    && mkdir -p /home/pwnmcp/.mitmproxy \
+    && chown pwnmcp:pwnmcp /home/pwnmcp/.mitmproxy
 
 # Fetch nuclei templates into the runtime user's home (used by scan_nuclei_scan).
 RUN if [ "$INSTALL_PD_TOOLS" = "true" ]; then \

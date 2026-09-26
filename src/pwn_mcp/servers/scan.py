@@ -25,6 +25,7 @@ from ..cli_run import (
     run_allowlisted,
     validate_argv,
 )
+from ..http_observe import baseline_from, classify, classify_reflection, matches_baseline
 from ..util import run_cmd, truncate, which
 
 mcp = FastMCP("scan")
@@ -210,26 +211,18 @@ async def dir_bruteforce(
         paths += [w + ext for w in words]
     sem = asyncio.Semaphore(concurrency)
     hits: list[dict] = []
+    spa_shells = 0
 
     async with httpx.AsyncClient(
         timeout=10.0, verify=False, headers={"User-Agent": UA},
         follow_redirects=False,
     ) as client:
-        # Fingerprint soft-404 behavior by requesting a non-existent path
-        soft_404: dict | None = None
-        if not status_filter:
-            try:
-                canary_slug = f"_pwn_soft404_{secrets.token_hex(6)}"
-                baseline_404 = await client.get(f"{base}/{canary_slug}")
-                if baseline_404.status_code != 404:
-                    soft_404 = {
-                        "status": baseline_404.status_code,
-                        "size": len(baseline_404.content),
-                    }
-            except httpx.HTTPError:
-                pass
+        # A catch-all that returns the site index (or one stable error page)
+        # is not a distinct document. Record it so the caller can ignore it.
+        documents, soft_404 = await _shell_documents(client, base)
 
         async def probe(path: str) -> None:
+            nonlocal spa_shells
             async with sem:
                 try:
                     r = await client.get(f"{base}/{path.lstrip('/')}")
@@ -237,26 +230,71 @@ async def dir_bruteforce(
                     return
             if status_filter and r.status_code not in status_filter:
                 return
-            if not status_filter:
-                if r.status_code == 404:
-                    return
-                if soft_404 and r.status_code == soft_404["status"]:
-                    if abs(len(r.content) - soft_404["size"]) <= 32:
-                        return
+            if not status_filter and r.status_code == 404:
+                return
+            if not status_filter and _is_shell(r, documents, soft_404):
+                spa_shells += 1
+                return
+            content_type = r.headers.get("content-type", "")
             hits.append({
                 "path": "/" + path.lstrip("/"),
                 "status": r.status_code,
                 "size": len(r.content),
+                "content_type": content_type,
+                "kind": classify(
+                    status=r.status_code,
+                    content_type=content_type,
+                    body=r.text,
+                    baseline=documents[0] if documents else None,
+                ),
                 "location": r.headers.get("location"),
             })
 
         await asyncio.gather(*(probe(p) for p in paths))
     hits.sort(key=lambda h: (h["status"], h["path"]))
-    result: dict = {"base": base, "tested": len(paths), "hits": hits}
+    result: dict = {
+        "base": base,
+        "tested": len(paths),
+        "hits": hits,
+        "spa_shells": spa_shells,
+    }
     if soft_404:
         result["soft_404_calibrated"] = True
         result["soft_404_status"] = soft_404["status"]
     return result
+
+
+async def _shell_documents(
+    client: httpx.AsyncClient, base: str
+) -> tuple[list[dict], dict | None]:
+    """Index document, plus a canary response when unknown paths are not 404."""
+    documents: list[dict] = []
+    soft_404: dict | None = None
+    try:
+        index = await client.get(base if base.endswith("/") else f"{base}/")
+        if index.status_code == 200:
+            documents.append(baseline_from(index.text))
+    except httpx.HTTPError:
+        pass
+    try:
+        canary = await client.get(f"{base}/_pwn_soft404_{secrets.token_hex(6)}")
+        if canary.status_code != 404:
+            documents.append(baseline_from(canary.text))
+            soft_404 = {
+                "status": canary.status_code,
+                "size": len(canary.content),
+            }
+    except httpx.HTTPError:
+        pass
+    return documents, soft_404
+
+
+def _is_shell(response: httpx.Response, documents: list[dict], soft_404: dict | None) -> bool:
+    if any(matches_baseline(response.text, doc) for doc in documents):
+        return True
+    if soft_404 and response.status_code == soft_404["status"]:
+        return abs(len(response.content) - soft_404["size"]) <= 32
+    return False
 
 
 def _canary() -> str:
@@ -336,6 +374,12 @@ async def param_fuzz(
 async def reflected_xss_probe(url: str, param: str, method: str = "GET") -> dict:
     """Inject a unique canary with special chars and analyze reflection context.
 
+    ``special_chars_unescaped`` is true only when the payload's own quotes or
+    angles come back raw, between the two canary copies. Tags in the rest of
+    the page do not count. ``appears_encoded`` means those characters came
+    back as HTML entities. ``reflection_in_error`` means the status is 500 or
+    higher. Encoded input on an error page is a reflection, not a confirmed XSS.
+
     Args:
         url: Target URL.
         param: Parameter name to inject into.
@@ -353,33 +397,9 @@ async def reflected_xss_probe(url: str, param: str, method: str = "GET") -> dict
                 r = await client.get(_with_params(url, {param: payload}))
         except httpx.HTTPError as e:
             raise ToolError(f"Request failed: {e}")
-    body = r.text
-    idx = body.find(canary)
-    if idx == -1:
-        return {"reflected": False, "param": param, "status": r.status_code}
-
-    # Examine surrounding context to classify the reflection
-    end = body.find("/", idx + len(canary))
-    segment = body[max(0, idx - 200): end + 1 if end != -1 else idx + 200]
-    chars = {"quote": "'" in segment or '"' in segment,
-             "angle": "<" in segment or ">" in segment}
-    context = "html_text"
-    open_tag = segment.rfind("<", 0, segment.find(canary))
-    close_tag = segment.rfind(">", 0, segment.find(canary))
-    if open_tag > close_tag:
-        context = "inside_tag_or_attr"
-    elif "<script" in segment.lower().split(canary)[0][-100:]:
-        context = "inside_script"
-    encoded = canary not in body or ("<" not in segment and "&lt;" in segment)
-    return {
-        "reflected": True,
-        "param": param,
-        "status": r.status_code,
-        "context": context,
-        "special_chars_unescaped": chars,
-        "appears_encoded": encoded,
-        "reflection_excerpt": segment,
-    }
+    judged = classify_reflection(r.text, canary, r.status_code)
+    judged["param"] = param
+    return judged
 
 
 @mcp.tool(
@@ -463,6 +483,7 @@ async def graphql_probe(url: str) -> dict:
                 headers={"Content-Type": "application/json"},
             )
             result["post_status"] = r.status_code
+            result["post_content_type"] = r.headers.get("content-type", "")
             try:
                 data = r.json()
             except ValueError:
@@ -488,6 +509,11 @@ async def graphql_probe(url: str) -> dict:
                     result["field_suggestions"] = True
             else:
                 result["introspection_enabled"] = False
+                result["response_kind"] = classify(
+                    status=r.status_code,
+                    content_type=result["post_content_type"],
+                    body=r.text,
+                )
                 result["raw_preview"] = truncate(r.text, 500)
         except httpx.HTTPError as e:
             result["post_error"] = str(e)
@@ -578,9 +604,13 @@ _SQLI_ERROR_PATTERNS = [
     r"postgresql.*error",
     r"pg_query\(\)",
     r"sqlite3::sqlexception",
+    r"sqlite_error",
     r"microsoft ole db provider for sql server",
     r"ora-\d{5}",
 ]
+_AUTH_FIELD = re.compile(
+    r'"(?:token|access_token|id_token|authentication)"\s*:', re.IGNORECASE
+)
 
 
 @mcp.tool(
@@ -588,52 +618,86 @@ _SQLI_ERROR_PATTERNS = [
     annotations={"openWorldHint": True},
     timeout=60.0,
 )
-async def sqli_probe(url: str, param: str, method: str = "GET") -> dict:
-    """Heuristic SQL injection probe testing quote syntax errors and boolean differential responses.
+async def sqli_probe(
+    url: str,
+    param: str,
+    method: str = "GET",
+    content_type: str = "form",
+) -> dict:
+    """Send SQL metacharacters in one parameter and report response differences.
+
+    ``content_type=form`` sends a query string (GET) or a form body (POST).
+    ``content_type=json`` always POSTs a JSON object ``{param: payload}``,
+    which is what JSON login and REST bodies expect.
+
+    Indicators are observations. ``error_based`` means the body matched a
+    database error string. ``boolean_differential`` is a response-size gap
+    between two payloads. ``auth_differential`` means a payload response
+    contains an auth field (``token``, ``authentication``, …) the baseline
+    did not. ``status_differential`` is only a status change. Read the
+    indicator type and decide. The tool does not identify the query or
+    extract data.
 
     Args:
         url: Target URL.
-        param: Parameter name to test.
-        method: GET or POST.
+        param: Parameter or JSON field name to test.
+        method: GET or POST. Ignored when content_type is json (sent as POST).
+        content_type: ``form`` (default) or ``json``.
     """
+    mode = content_type.strip().lower()
+    if mode not in ("form", "json"):
+        raise ToolError("content_type must be 'form' or 'json'")
+    sent_method = "POST" if mode == "json" else method.upper()
     indicators = []
+
+    async def send(client: httpx.AsyncClient, value: str) -> httpx.Response:
+        if mode == "json":
+            return await client.post(url, json={param: value})
+        if sent_method == "POST":
+            return await client.post(url, data={param: value})
+        return await client.get(_with_params(url, {param: value}))
+
     async with httpx.AsyncClient(
         timeout=15.0, verify=False, headers={"User-Agent": UA}, follow_redirects=True
     ) as client:
         try:
-            if method.upper() == "POST":
-                base_resp = await client.post(url, data={param: "1"})
-            else:
-                base_resp = await client.get(_with_params(url, {param: "1"}))
+            base_resp = await send(client, "1")
         except httpx.HTTPError as e:
             raise ToolError(f"Baseline request failed: {e}")
 
         for quote in ("'", '"', "''"):
+            payload = f"1{quote}"
             try:
-                if method.upper() == "POST":
-                    r = await client.post(url, data={param: f"1{quote}"})
-                else:
-                    r = await client.get(_with_params(url, {param: f"1{quote}"}))
+                r = await send(client, payload)
             except httpx.HTTPError:
                 continue
-
+            matched = False
             for pattern in _SQLI_ERROR_PATTERNS:
                 if re.search(pattern, r.text, re.IGNORECASE):
                     indicators.append({
                         "type": "error_based",
-                        "payload": f"1{quote}",
+                        "payload": payload,
                         "matched_error": pattern,
                         "status": r.status_code,
                     })
+                    matched = True
+                    break
+            if (
+                not matched
+                and r.status_code != base_resp.status_code
+                and max(r.status_code, base_resp.status_code) >= 500
+                and not any(item["type"] == "status_differential" for item in indicators)
+            ):
+                indicators.append({
+                    "type": "status_differential",
+                    "payload": payload,
+                    "baseline_status": base_resp.status_code,
+                    "status": r.status_code,
+                })
 
         try:
-            if method.upper() == "POST":
-                r_true = await client.post(url, data={param: "1' OR '1'='1"})
-                r_false = await client.post(url, data={param: "1' OR '1'='2"})
-            else:
-                r_true = await client.get(_with_params(url, {param: "1' OR '1'='1"}))
-                r_false = await client.get(_with_params(url, {param: "1' OR '1'='2"}))
-
+            r_true = await send(client, "1' OR '1'='1")
+            r_false = await send(client, "1' OR '1'='2")
             delta = abs(len(r_true.content) - len(r_false.content))
             if delta > 80 and (r_true.status_code == 200 or r_false.status_code == 200):
                 indicators.append({
@@ -647,9 +711,32 @@ async def sqli_probe(url: str, param: str, method: str = "GET") -> dict:
         except httpx.HTTPError:
             pass
 
+        # JSON logins often accept a comment-terminated tautology and return a
+        # token instead of a SQL error string. Compare that to the baseline.
+        if not any(item["type"] == "auth_differential" for item in indicators):
+            try:
+                r_auth = await send(client, "' OR 1=1--")
+            except httpx.HTTPError:
+                r_auth = None
+            if (
+                r_auth is not None
+                and _AUTH_FIELD.search(r_auth.text)
+                and not _AUTH_FIELD.search(base_resp.text)
+            ):
+                indicators.append({
+                    "type": "auth_differential",
+                    "payload": "' OR 1=1--",
+                    "baseline_status": base_resp.status_code,
+                    "status": r_auth.status_code,
+                    "body_preview": truncate(r_auth.text, 400),
+                })
+
     return {
         "url": url,
         "param": param,
+        "method": sent_method,
+        "content_type": mode,
+        "baseline_status": base_resp.status_code,
         "vulnerable": bool(indicators),
         "indicators": indicators,
     }
@@ -1039,7 +1126,10 @@ async def content_discover(
     recurse_depth: int = 1,
     concurrency: int = 20,
 ) -> dict:
-    """Content discovery 2.0: bundled wordlist + sitemap/JS-fed paths + optional recurse.
+    """Content discovery: bundled wordlist + sitemap/JS-fed paths + optional recurse.
+
+    Responses that match the site index or a stable catch-all page are counted
+    in ``spa_shells`` and left out of ``hits``. ``kind`` labels what remains.
 
     Args:
         url: Base URL.
@@ -1083,8 +1173,11 @@ async def content_discover(
 
         sem = asyncio.Semaphore(concurrency)
         hits: list[dict] = []
+        documents, soft_404 = await _shell_documents(client, base)
+        spa_shells = 0
 
         async def probe(path: str) -> None:
+            nonlocal spa_shells
             async with sem:
                 try:
                     r = await client.get(f"{base}/{path.lstrip('/')}")
@@ -1092,10 +1185,21 @@ async def content_discover(
                     return
             if r.status_code == 404:
                 return
+            if _is_shell(r, documents, soft_404):
+                spa_shells += 1
+                return
+            content_type = r.headers.get("content-type", "")
             hits.append({
                 "path": "/" + path.lstrip("/"),
                 "status": r.status_code,
                 "size": len(r.content),
+                "content_type": content_type,
+                "kind": classify(
+                    status=r.status_code,
+                    content_type=content_type,
+                    body=r.text,
+                    baseline=documents[0] if documents else None,
+                ),
                 "location": r.headers.get("location"),
             })
 
@@ -1111,7 +1215,12 @@ async def content_discover(
             await asyncio.gather(*(probe(p) for p in children))
 
     hits.sort(key=lambda h: (h["status"], h["path"]))
-    return {"base": base, "tested": len(paths), "hits": hits[:400]}
+    return {
+        "base": base,
+        "tested": len(paths),
+        "hits": hits[:400],
+        "spa_shells": spa_shells,
+    }
 
 
 @mcp.tool(

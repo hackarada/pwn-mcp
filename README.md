@@ -107,32 +107,37 @@ MCP does not keep a recon notepad. Use MCP for **capabilities** and for
 
 Typical loop:
 
-1. `playbook_run(name="web2_recon", target="example.com")` — sync steps + job ids
-2. Poll `jobs_status` / `jobs_result` for subfinder / nuclei
-3. `recon_url_triage` on URL lists; `recon_tech_fingerprint` for stack→bug hints
-4. Typed probes (`scan_ssrf_probe`, `scan_idor_probe`, …) or `scan_cli_run`
+1. Typed recon (`recon_tech_fingerprint`, `recon_fetch_robots`, `recon_js_analyze`)
+2. `recon_probe_paths` on the paths those calls returned. Read `kind`.
+   `spa_shell` means the body matched the site index.
+3. Follow the documents that are not the shell: JSON bodies, directory listings,
+   login routes, parameters on real responses
+4. Typed probes (`scan_sqli_probe`, `scan_reflected_xss_probe`, …) or `scan_cli_run`
 5. Long work → `jobs_start` (kinds: `cli_run`, `nuclei_scan`, `nmap_scan`,
    `subfinder_enum`, `monitor_subs`, `hash_crack`)
+
+`playbook_run` only batches those calls and returns the step data. It does not
+decide that the test is finished.
 
 **Wrappers vs `scan_cli_run`:** prefer typed tools (`scan_nuclei_scan`,
 `scan_httpx_probe`, …). Use `scan_cli_run` when you need flags the wrapper
 does not expose. Shell metacharacters, absolute paths, and file I/O flags
 are rejected; targets are scope-checked.
 
-**5-minute kill signals:** only 403/static pages, no APIs/JS endpoints, empty
-nuclei — move on. Stack→bug map is in server instructions and
-`recon_tech_fingerprint.stack_bug_hints`.
+Stack→bug hints are observations on `recon_tech_fingerprint`, not a test plan.
+The agent decides when a target has no distinct documents left to request.
 
 ## Tool catalog
 
 | Namespace   | Tools |
 |---|---|
-| `recon_`    | `http_request`, `security_headers`, `tls_cert_info`, `tech_fingerprint`, `fetch_robots`, `dns_lookup`, `whois_lookup`, `cors_check`, `crawl_links`, `js_analyze`, `api_discover`, `websocket_probe`, `scope_check`, `secrets_scan`, `session_extract`, `url_triage` |
-| `crypto_`   | `encode`, `decode`, `hash_text`, `hash_identify`, `jwt_decode`, `jwt_sign`, `jwt_attack`, `hash_crack_enqueue`, `transform`, `xor`, `caesar` |
+| `recon_`    | `http_request`, `http_batch`, `security_headers`, `tls_cert_info`, `tech_fingerprint`, `fetch_robots`, `dns_lookup`, `whois_lookup`, `cors_check`, `crawl_links`, `js_analyze`, `api_discover`, `probe_paths`, `websocket_probe`, `scope_check`, `secrets_scan`, `session_extract`, `url_triage` |
+| `crypto_`   | `encode`, `decode`, `hash_text`, `hash_identify`, `jwt_decode`, `jwt_sign`, `jwt_attack`, `totp`, `hash_crack_enqueue`, `transform`, `xor`, `caesar` |
 | `scan_`     | `port_scan`, `nmap_scan`, `subdomain_enum`, `subfinder_enum`, `httpx_probe`, `katana_crawl`, `naabu_scan`, `dnsx_resolve`, `nuclei_list_tags`, `nuclei_list_templates`, `nuclei_templates_version`, `nuclei_scan`, `cli_tools`, `cli_run`, `dir_bruteforce`, `content_discover`, `param_fuzz`, `reflected_xss_probe`, `open_redirect_check`, `graphql_probe`, `graphql_deep`, `ssti_probe`, `sqli_probe`, `ssrf_probe`, `idor_probe`, `cache_probe`, `host_header_probe`, `subdomain_takeover_check`, `cloud_bucket_probe` |
 | `proxy_`    | `start`, `stop`, `status`, `history`, `get_traffic`, `endpoints`, `set_headers`, `clear`, `intercept`, `held`, `resume`, `replay`, `match_replace`, `match_replace_list`, `export_har`, `export_burp` |
 | `jobs_`     | `start`, `status`, `result`, `list`, `cancel` |
 | `playbook_` | `list`, `run` (`recon_surface`, `api_pass`, `xss_pass`, `web2_recon`) |
+| `browser_*` | Optional — Playwright MCP HTTP sidecar (`PWN_MCP_BROWSER=1` + `PWN_MCP_BROWSER_URL`): `navigate`, `snapshot`, `click`, `type`, `fill_form`, `tabs`, `evaluate`, `take_screenshot`, … |
 
 Tools are pure Python (httpx, dnspython, cryptography, websockets) where possible.
 Optional binaries activate only when present on `PATH` and return a clear
@@ -240,6 +245,58 @@ mitmproxy auto-generates a CA at `~/.mitmproxy/mitmproxy-ca-cert.pem` on
 first run. Trust it system-wide or pass it as `SSL_CERT_FILE` to your agent
 process to enable full HTTPS inspection.
 
+## Browser (optional Playwright MCP sidecar)
+
+SPA / DOM work needs a real browser. Mount
+[Playwright MCP](https://playwright.dev/mcp/introduction) over **HTTP** via
+FastMCP's [Proxy Provider](https://gofastmcp.com/servers/providers/proxy).
+Each MCP client connection gets its own Playwright session, kept open
+across tool calls, so page state survives navigate, snapshot, and click.
+Tools keep their native names (`browser_navigate`, `browser_snapshot`, …).
+
+Compose profile `browser` runs Microsoft's image
+(`mcr.microsoft.com/playwright/mcp`) as a sidecar on the internal network
+only (no host port). pwn-mcp proxies to it; clients still talk only to
+`http://<host>:8000/mcp`.
+
+```bash
+# .env
+PWN_MCP_BROWSER=1
+PWN_MCP_BROWSER_URL=http://playwright:8931/mcp
+PWN_MCP_PROXY_PORT=8080
+PWN_MCP_BROWSER_PROXY=http://pwn-mcp:8080   # compose DNS, not 127.0.0.1
+
+docker compose --profile browser up -d --build
+```
+
+Chromium's `--proxy-server` is set on the **sidecar** (default
+`http://pwn-mcp:8080`) so navigations flow through `proxy_*` and out-of-scope
+hosts are blocked at the wire. Scope middleware also rejects out-of-scope
+`browser_navigate` URLs; Playwright element refs (`target: "e5"`) are not
+treated as hosts.
+
+The sidecar listens on the compose network with `--allowed-hosts=*`. Without
+that, Playwright allows only `localhost:8931`, returns 403 to pwn-mcp, and
+`browser_*` tools never show up in `tools/list`. The port is not published
+on the host.
+
+The sidecar uses `--shared-browser-context` so HTTP clients share one browser
+context. pwn-mcp keeps that session for the life of the client connection.
+
+Playwright advertises `outputSchema: {}`. The MCP tool schema requires
+`type: "object"` whenever that field is present, and a client that checks
+it rejects the entire `tools/list` payload. pwn-mcp rewrites sidecar
+schemas before they are listed, so `browser_*` and the local tools stay
+visible together.
+
+`PWN_MCP_PROXY_PORT` is required when the browser is enabled. The entrypoint
+waits until the sidecar accepts connections, then starts the MCP process, so
+`browser_*` tools are not mounted against a closed port.
+
+Chromium runs in the sidecar. `http://127.0.0.1:3000/` from a browser tool is
+the sidecar, not an app published on the host. Open
+`http://host.docker.internal:3000/` (or whichever host port the app uses).
+
 ## Development
 
 ```bash
@@ -255,9 +312,11 @@ dbmate --migrations-dir .migration up
 ```
 
 Layout: `src/pwn_mcp/servers/{recon,crypto,scan,proxy,jobs,playbook}.py` are
-child FastMCP servers mounted with namespaces in `server.py`. `scope.py` +
-`middleware.py` implement the scope guardrail. `proxy_server.py` manages the
-mitmproxy lifecycle, intercept, and telemetry. `store.py` / `jobs.py` persist
-background jobs in PostgreSQL (`DATABASE_URL`; migrations in `.migration/`).
-Bundled wordlists live in
-`src/pwn_mcp/data/`.
+child FastMCP servers mounted with namespaces in `server.py`. Optional
+Playwright MCP is mounted via `browser.py` (FastMCP Proxy Provider over HTTP)
+when `PWN_MCP_BROWSER=1` and `PWN_MCP_BROWSER_URL` point at the compose
+`playwright` sidecar (`--profile browser`). `scope.py` + `middleware.py`
+implement the scope guardrail. `proxy_server.py` manages the mitmproxy
+lifecycle, intercept, and telemetry. `store.py` / `jobs.py` persist background
+jobs in PostgreSQL (`DATABASE_URL`; migrations in `.migration/`). Bundled
+wordlists live in `src/pwn_mcp/data/`.

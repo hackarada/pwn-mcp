@@ -72,14 +72,16 @@ async def test_cache_probe(mcp_client: Client, http_server: str):
 async def test_content_discover(mcp_client: Client, http_server: str):
     r = await mcp_client.call_tool("scan_content_discover", {
         "url": http_server,
-        "extra_paths": ["admin", "robots.txt"],
+        "extra_paths": ["admin", "robots.txt", "shell/missing"],
         "from_sitemap": True,
         "from_js": False,
         "recurse_depth": 0,
     })
     assert r.data["tested"] >= 1
     paths = {h["path"] for h in r.data["hits"]}
-    assert "/admin" in paths or "/robots.txt" in paths or len(r.data["hits"]) >= 0
+    assert "/admin" in paths or "/robots.txt" in paths
+    assert "/shell/missing" not in paths
+    assert r.data["spa_shells"] >= 1
 
 
 async def test_graphql_deep(mcp_client: Client, http_server: str):

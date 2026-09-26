@@ -6,7 +6,7 @@ from fastmcp.exceptions import ToolError
 
 from pwn_mcp.middleware import ScopeEnforcementMiddleware
 from pwn_mcp.scope import Scope
-from pwn_mcp.util import target_host
+from pwn_mcp.util import is_probable_scan_target, target_host
 
 
 def _scoped_server(scope_text: str) -> FastMCP:
@@ -15,6 +15,10 @@ def _scoped_server(scope_text: str) -> FastMCP:
     @srv.tool
     def ping(url: str) -> str:
         return f"pong {url}"
+
+    @srv.tool
+    def click(target: str) -> str:
+        return f"clicked {target}"
 
     srv.add_middleware(
         ScopeEnforcementMiddleware(Scope.parse(scope_text)))
@@ -27,6 +31,20 @@ def test_target_host_normalization():
     assert target_host("example.com") == "example.com"
     assert target_host("[::1]") == "::1"
     assert target_host("http://sub.a.b.example.com/x") == "sub.a.b.example.com"
+
+
+def test_is_probable_scan_target():
+    assert is_probable_scan_target("https://example.com/x")
+    assert is_probable_scan_target("example.com")
+    assert is_probable_scan_target("10.0.0.1")
+    assert is_probable_scan_target("localhost")
+    assert is_probable_scan_target("intranet")
+    # Playwright a11y refs + selectors must not be scoped as hosts
+    assert not is_probable_scan_target("e5")
+    assert not is_probable_scan_target("e12")
+    assert not is_probable_scan_target(".btn-primary")
+    assert not is_probable_scan_target("#login")
+    assert not is_probable_scan_target("")
 
 
 def test_scope_parse_and_match_sync():
@@ -70,6 +88,35 @@ async def test_middleware_denies_out_of_scope():
             await c.call_tool("ping", {"url": "https://evil.com/"})
         with pytest.raises(ToolError):
             await c.call_tool("ping", {"url": "http://10.0.0.1/"})
+
+
+async def test_middleware_checks_nested_request_urls():
+    srv = FastMCP("scoped-batch")
+
+    @srv.tool
+    def batch(requests: list[dict]) -> str:
+        return "ok"
+
+    srv.add_middleware(ScopeEnforcementMiddleware(Scope.parse("example.com")))
+    async with Client(srv) as c:
+        r = await c.call_tool(
+            "batch", {"requests": [{"url": "https://example.com/a"}]})
+        assert r.data == "ok"
+        with pytest.raises(ToolError, match="outside the authorized scope"):
+            await c.call_tool("batch", {"requests": [
+                {"url": "https://example.com/a"},
+                {"url": "https://evil.com/b"},
+            ]})
+
+
+async def test_middleware_ignores_playwright_a11y_refs():
+    """browser_click(target='e5') must not be treated as a host."""
+    srv = _scoped_server("example.com")
+    async with Client(srv) as c:
+        r = await c.call_tool("click", {"target": "e5"})
+        assert r.data == "clicked e5"
+        with pytest.raises(ToolError, match="outside the authorized scope"):
+            await c.call_tool("click", {"target": "https://evil.com/"})
 
 
 async def test_no_scope_is_unrestricted():

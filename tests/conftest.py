@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 import subprocess
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -59,6 +62,10 @@ GRAPHQL_SCHEMA = {
 
 
 class Handler(BaseHTTPRequestHandler):
+    race_lock = threading.Lock()
+    race_inflight = 0
+    race_peak = 0
+
     def log_message(self, *a):  # silence test server logs
         pass
 
@@ -88,6 +95,14 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/echo":
             q = qs.get("q", "")
             self._send(200, f"<html>You said: {q}</html>".encode())
+        elif path == "/error_echo":
+            q = html.escape(qs.get("q", ""), quote=True)
+            page = (
+                "<html><head><title>Error: near "
+                + q
+                + "</title></head><body><h1>Error</h1><p>stack</p></body></html>"
+            )
+            self._send(500, page.encode())
         elif path == "/search":
             q = qs.get("q", "")
             self._send(200, f"results for {q}: none".encode())
@@ -110,6 +125,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/json":
             self._send(200, json.dumps({"ok": True}).encode(),
                        ctype="application/json")
+        elif path == "/long":
+            self._send(200, b"L" * 20000, ctype="text/plain")
         elif path == "/static/app.js":
             self._send(200, APP_JS.encode(), ctype="application/javascript")
         elif path == "/static/app.js.map":
@@ -143,12 +160,50 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, b"result: user1, user2, user3, user4, user5 (all data rows returned for true)")
             else:
                 self._send(200, b"result: none")
+        elif path.startswith("/shell"):
+            self._send(200, PAGE.encode())
         else:
             self._send(404, b"not found")
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode()
+        raw = self.rfile.read(length)
+        path = self.path.split("?", 1)[0]
+        if path == "/upload":
+            match = re.search(br'filename="([^"]*)"', raw)
+            filename = match.group(1).decode() if match else ""
+            self._send(200, json.dumps({
+                "content_type": self.headers.get("Content-Type", ""),
+                "filename": filename,
+                "length": length,
+                "body": raw.decode("utf-8", "replace"),
+            }).encode(), ctype="application/json")
+            return
+        if path == "/race":
+            with Handler.race_lock:
+                Handler.race_inflight += 1
+                Handler.race_peak = max(Handler.race_peak, Handler.race_inflight)
+                peak = Handler.race_peak
+            time.sleep(0.3)
+            with Handler.race_lock:
+                Handler.race_inflight -= 1
+                if Handler.race_inflight == 0:
+                    Handler.race_peak = 0
+            self._send(200, json.dumps({"peak": peak}).encode(),
+                       ctype="application/json")
+            return
+        body = raw.decode()
+        if path == "/login":
+            if "OR 1=1" in body:
+                self._send(
+                    200,
+                    b'{"authentication":{"token":"eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYWRtaW4ifQ.x"}}',
+                    ctype="application/json",
+                )
+            else:
+                self._send(401, b'{"error":"Invalid email or password"}',
+                           ctype="application/json")
+            return
         if self.path == "/graphql":
             if "__schema" in body:
                 self._send(200, json.dumps(GRAPHQL_SCHEMA).encode(),

@@ -18,6 +18,23 @@ services:
       retries: 10
       start_period: 10s
 
+  # Named volumes are created root-owned. This one-shot fixes the two
+  # directories the unprivileged server must write, then exits.
+  # Use alpine (not pwn-mcp:latest) so a cold machine does not try to pull a
+  # private/nonexistent hub image before the local build finishes.
+  volume-init:
+    image: alpine:3.20
+    user: "0:0"
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        mkdir -p /home/pwnmcp/.mitmproxy /home/pwnmcp/nuclei-templates
+        chown 10001:10001 /home/pwnmcp/.mitmproxy /home/pwnmcp/nuclei-templates
+    volumes:
+      - mitm-ca:/home/pwnmcp/.mitmproxy
+      - nuclei-templates:/home/pwnmcp/nuclei-templates
+    restart: "no"
+
   pwn-mcp:
     build:
       context: .
@@ -27,12 +44,18 @@ services:
     image: pwn-mcp:latest
     restart: unless-stopped
     depends_on:
+      volume-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     ports:
+      # MCP API. Cursor and other MCP clients use this (http://127.0.0.1:8000/mcp).
       - "${PWN_MCP_PORT:-8000}:8000"
-      # Intercepting proxy (only useful when PWN_MCP_PROXY_PORT is set)
-      - "${PWN_MCP_PROXY_PUBLISH:-8080}:8080"
+      # Intercepting proxy for a browser or CLI on the host
+      # (HTTP_PROXY=http://127.0.0.1:8080). The MCP client does not connect here.
+      # Right-hand port is where mitmproxy listens (PWN_MCP_PROXY_PORT).
+      # Default host bind is localhost; set PWN_MCP_PROXY_PUBLISH=8080 to open it.
+      - "${PWN_MCP_PROXY_PUBLISH:-127.0.0.1:8080}:${PWN_MCP_PROXY_PORT:-8080}"
     environment:
       PWN_MCP_TRANSPORT: http
       PWN_MCP_HOST: "0.0.0.0"
@@ -44,6 +67,9 @@ services:
       # Optional: auto-start mitmproxy (bind all interfaces in containers)
       PWN_MCP_PROXY_PORT: ${PWN_MCP_PROXY_PORT:-}
       PWN_MCP_PROXY_HOST: ${PWN_MCP_PROXY_HOST:-0.0.0.0}
+      # Optional Playwright MCP sidecar (compose profile: browser)
+      PWN_MCP_BROWSER: ${PWN_MCP_BROWSER:-}
+      PWN_MCP_BROWSER_URL: ${PWN_MCP_BROWSER_URL:-}
       # Refresh nuclei templates on each container start (default on)
       PWN_MCP_UPDATE_NUCLEI_TEMPLATES: ${PWN_MCP_UPDATE_NUCLEI_TEMPLATES:-true}
       # PostgreSQL for background jobs (dbmate migrations on boot)
@@ -67,7 +93,39 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 120s
+      start_period: 180s
+
+  # Playwright MCP sidecar (browsers). Enable with:
+  #   docker compose --profile browser up -d
+  # and set PWN_MCP_BROWSER=1, PWN_MCP_BROWSER_URL=http://playwright:8931/mcp,
+  # and PWN_MCP_PROXY_PORT so mitmproxy is listening.
+  # This container is started after pwn-mcp is created. pwn-mcp's entrypoint
+  # waits until port 8931 accepts connections before it mounts browser tools.
+  # Chromium in this container cannot open 127.0.0.1 on the host. Agents use
+  # http://host.docker.internal:<port>/ for an app published on the host.
+  playwright:
+    profiles: ["browser"]
+    image: mcr.microsoft.com/playwright/mcp
+    init: true
+    restart: unless-stopped
+    entrypoint: ["node"]
+    command:
+      - /app/cli.js
+      - --headless
+      - --browser=chromium
+      - --no-sandbox
+      - --port=8931
+      - --host=0.0.0.0
+      # Bound to the compose network only (no host port). The default host
+      # check allows localhost:8931, so calls from pwn-mcp (Host: playwright)
+      # are 403 and browser tools never appear in tools/list.
+      - --allowed-hosts=*
+      - --shared-browser-context
+      - --ignore-https-errors
+      - --proxy-server=${PWN_MCP_BROWSER_PROXY:-http://pwn-mcp:8080}
+    # No host ports — only reachable on the compose network
+    depends_on:
+      - pwn-mcp
 
 volumes:
   mitm-ca:

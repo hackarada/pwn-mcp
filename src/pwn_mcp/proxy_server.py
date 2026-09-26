@@ -311,8 +311,18 @@ class ProxyManager:
         if error_holder:
             raise RuntimeError(f"Failed to start mitmproxy: {error_holder[0]}")
 
-        # Brief settle time to verify socket is open
+        # Addon failures (for example a CA directory the process cannot write)
+        # make DumpMaster return without raising. The listen socket can stay
+        # open after that, so a successful bind is not proof the proxy is up.
         time.sleep(0.3)
+        if error_holder:
+            raise RuntimeError(f"Failed to start mitmproxy: {error_holder[0]}")
+        if not self.is_running():
+            confdir = os.path.expanduser("~/.mitmproxy")
+            raise RuntimeError(
+                "mitmproxy exited during startup. "
+                f"The CA directory ({confdir}) must be writable by the server user."
+            )
         return self.get_status()
 
     def stop(self) -> dict:
