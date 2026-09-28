@@ -183,6 +183,37 @@ def _directory_listing(body: str, title: str) -> bool:
     return "index of /" in head or "<title>index of" in head
 
 
+_LISTING_LINK = re.compile(
+    r"""<a\s[^>]*href=["']([^"'#]+)["'][^>]*>(?:\s*<span[^>]*class=["'][^"']*\bname\b[^"']*["'][^>]*>)?\s*([^<]*)""",
+    re.IGNORECASE,
+)
+_LISTING_SKIP = frozenset({".", "..", "/", "./", "../"})
+
+
+def directory_entries(body: str, limit: int = 200) -> list[dict]:
+    """Names and hrefs from an Apache or serve-index directory page.
+
+    The HTML around those links is mostly CSS. Callers should return this
+    list and drop the page body.
+    """
+    entries: list[dict] = []
+    seen: set[str] = set()
+    for href, label in _LISTING_LINK.findall(body):
+        href = href.strip()
+        if href in _LISTING_SKIP or href.startswith("?"):
+            continue
+        name = _WS.sub(" ", label).strip() or href.rstrip("/").rsplit("/", 1)[-1]
+        if name in ("", ".", ".."):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        entries.append({"name": name, "href": href})
+        if len(entries) >= limit:
+            break
+    return entries
+
+
 def classify(
     *,
     status: int,

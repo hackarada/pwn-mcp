@@ -11,10 +11,12 @@ import os
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from fastmcp.server.transforms import ResourcesAsTools
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 
 from .browser import create_browser_proxy
+from .guide import register as register_guide
 from .middleware import ScopeEnforcementMiddleware, ToolSchemaMiddleware
 from .proxy_server import proxy_manager
 from .scope import load_scope
@@ -46,61 +48,14 @@ def _auth_from_env() -> StaticTokenVerifier | None:
     )
 
 
-_STACK_BUG_MAP = (
-    "Stack→bug hints: Rails/Laravel/Django→IDOR/mass-assignment; Flask→SSTI/SSRF; "
-    "Express→prototype pollution; Spring→actuators; Next.js→server-action SSRF; "
-    "GraphQL→introspection/mutation authz; WordPress→plugins/REST. "
-    "See recon_tech_fingerprint.stack_bug_hints."
-)
-
 mcp = FastMCP(
     "pwn-mcp",
     instructions=(
-        "Security testing toolkit for web/API/SPA (CTF, VDP, authorized testing). "
-        "Namespaces: recon_* (HTTP/DNS/TLS/WS/JS/API/session/secrets/url_triage), "
-        "crypto_* (encode/JWT/jwt_attack/hash + hash_crack_enqueue), "
-        "scan_* (ports/dirs/vuln probes + PD wrappers + ssrf/idor/cache/host/"
-        "takeover/buckets/graphql_deep + nmap/subfinder/nuclei/cli_run), "
-        "proxy_* (history, intercept/resume, replay, match_replace, export_har/burp), "
-        "browser_* (optional Playwright HTTP sidecar — navigate/snapshot/click/type "
-        "for SPAs; route Chromium through proxy_* via PWN_MCP_BROWSER_PROXY), "
-        "jobs_* (background long scans — use when nuclei/nmap/cli_run/hashcat would "
-        "exceed tool timeouts; poll jobs_status/jobs_result; kinds include "
-        "cli_run, nuclei_scan, nmap_scan, subfinder_enum, monitor_subs, hash_crack), "
-        "playbook_* (recon_surface, api_pass, xss_pass, web2_recon — batches calls "
-        "and returns step data + job ids; it does not conclude the test). "
-        "recon_probe_paths labels each path: json, html, text, directory_listing, "
-        "error, or spa_shell when the body matches the site index. A 200 HTML "
-        "spa_shell is the catch-all page, not an API document. "
-        "Prefer typed tools; use scan_cli_run for full CLI flags on the allowlist "
-        "(nuclei,subfinder,nmap,whois,dig,httpx,katana,naabu,dnsx,ffuf,assetfinder). "
-        "For nuclei: scan_nuclei_list_tags → list_templates → scan or jobs_start. "
-        "For SPAs: browser_navigate → browser_snapshot → interact by ref; "
-        "then proxy_endpoints / proxy_history for XHR inventory. "
-        "scan_sqli_probe content_type=json POSTs a JSON field; form is the default. "
-        "scan_reflected_xss_probe and playbook xss_pass only see server-side reflection. "
-        "appears_encoded or reflection_in_error means the payload was escaped or "
-        "the hit was an error page, not a confirmed XSS. "
-        "recon_http_request fields projects a JSON body before truncation "
-        "(data[].name walks a list). body_limit raises that cap up to 100000. "
-        "multipart builds a file field from name, filename, content, and size. "
-        "recon_http_batch sends up to 10 requests at once for a race or "
-        "double-submit. recon_websocket_probe steps is a script of send or "
-        "wait_prefix; use it when the server must ack before the next frame "
-        "(socket.io: wait for 0, send 40, wait for 40, then send the event). "
-        "crypto_jwt_sign accepts RS256, RS384, and RS512 with private_key_pem, "
-        "and secret_encoding=base64 for a raw HMAC key. crypto_totp returns a "
-        "fresh code for a base32 secret. "
-        "Browser tools run in the Playwright sidecar. 127.0.0.1 and localhost "
-        "there are the sidecar, not the host. For an app published on the Docker "
-        "host, open http://host.docker.internal:<port>/. "
-        "Agent owns session memory and decides what to follow. MCP does not store "
-        "tokens or recon notepads and does not tell you to stop. A token in a "
-        "JSON body must be sent on the next request as Authorization: Bearer "
-        "and Cookie: token=... . "
-        f"{_STACK_BUG_MAP} "
-        "If a scope file is configured, active tools only run in-scope. "
-        "Only use against targets you are authorized to test."
+        "Security testing tools for authorized web, API, and SPA testing. "
+        "Call list_resources, then read_resource with uri pwn://guide, before "
+        "choosing tools. tools/list is the catalog. Tools return evidence; "
+        "you decide what to follow. Only use against targets you are authorized "
+        "to test."
     ),
     version="0.1.0",
     auth=_auth_from_env(),
@@ -112,6 +67,10 @@ mcp.mount(scan_mcp, namespace="scan")
 mcp.mount(proxy_mcp, namespace="proxy")
 mcp.mount(jobs_mcp, namespace="jobs")
 mcp.mount(playbook_mcp, namespace="playbook")
+
+register_guide(mcp)
+# Tool-only clients cannot call resources/read. These two tools are read-only.
+mcp.add_transform(ResourcesAsTools(mcp))
 
 _browser = create_browser_proxy()
 if _browser is not None:

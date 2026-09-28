@@ -1,5 +1,7 @@
 """Tests for recon_* tools against the local fixture HTTP server."""
 
+import base64
+
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
@@ -58,6 +60,50 @@ async def test_http_request_multipart_pads_to_size(mcp_client: Client, http_serv
     assert "big.png" in r.data["body"]
     assert "hiAAAAAA" in r.data["body"]
     assert "multipart/form-data" in r.data["body"]
+
+
+async def test_http_request_binary_is_base64(mcp_client: Client, http_server: str):
+    r = await mcp_client.call_tool("recon_http_request", {"url": f"{http_server}/binary"})
+    assert r.data["kind"] == "binary"
+    assert r.data["body_encoding"] == "base64"
+    assert r.data["body_length"] == 6
+    assert base64.b64decode(r.data["body"]) == b"\xff\xfe\x00pyc"
+
+
+async def test_http_request_listing_replaces_html(mcp_client: Client, http_server: str):
+    r = await mcp_client.call_tool("recon_http_request", {"url": f"{http_server}/files"})
+    assert r.data["kind"] == "directory_listing"
+    assert r.data["body"] == "2 entries"
+    names = [item["name"] for item in r.data["listing"]]
+    assert names == ["acquisitions.md", "quarantine"]
+
+
+async def test_http_request_reports_set_cookie(mcp_client: Client, http_server: str):
+    r = await mcp_client.call_tool("recon_http_request", {"url": f"{http_server}/set-cookie"})
+    assert r.data["set_cookies"] == ["token=abc123; Path=/"]
+
+
+async def test_http_request_stamps_totp_at_send_time(mcp_client: Client, http_server: str):
+    r = await mcp_client.call_tool("recon_http_request", {
+        "url": f"{http_server}/totp",
+        "method": "POST",
+        "body": '{"code":"{{totp}}"}',
+        "totp_secret": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+        "totp_at": 1111111109,
+    })
+    assert r.data["status"] == 200
+    assert r.data["totp"]["code"] == "081804"
+    assert "081804" in r.data["body"]
+
+
+async def test_http_vary_reports_which_body_succeeded(mcp_client: Client, http_server: str):
+    r = await mcp_client.call_tool("recon_http_vary", {
+        "url": f"{http_server}/guess",
+        "bodies": ["nope", "correct-horse"],
+    })
+    assert r.data["hits"] == [1]
+    assert r.data["results"][0]["status"] == 401
+    assert r.data["results"][1]["status"] == 200
 
 
 async def test_http_batch_overlaps(mcp_client: Client, http_server: str):

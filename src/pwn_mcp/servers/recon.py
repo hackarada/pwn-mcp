@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import math
 import re
@@ -20,18 +21,30 @@ from fastmcp.exceptions import ToolError
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import WebSocketException
 
-from ..http_observe import baseline_from, classify, html_title, preview, project_json
+from ..http_observe import (
+    baseline_from,
+    classify,
+    directory_entries,
+    html_title,
+    preview,
+    project_json,
+)
 from ..scope import load_scope
 from ..util import MAX_BODY_CHARS, run_cmd, target_host, truncate, which
+from .crypto import totp as fresh_totp
 
 mcp = FastMCP("recon")
 
 UA = "pwn-mcp/0.1 (security testing)"
 _TIMEOUT = httpx.Timeout(15.0, connect=8.0)
+_VARY_TIMEOUT = httpx.Timeout(8.0, connect=4.0)
 _BATCH_MAX = 10
+_VARY_MAX = 20
+_VARY_BODY_CHARS = 400
 _MULTIPART_MAX = 2_000_000
 _BODY_LIMIT_MAX = 100_000
 _WS_STEP_MAX = 20
+_TOTP_MARK = "{{totp}}"
 
 
 def _client(verify_tls: bool = False, follow_redirects: bool = True) -> httpx.AsyncClient:
@@ -96,6 +109,84 @@ def _drop_content_type(headers: dict[str, str] | None) -> dict[str, str] | None:
     return {key: value for key, value in headers.items() if key.lower() != "content-type"}
 
 
+def _apply_totp(
+    body: str | None,
+    headers: dict[str, str] | None,
+    secret: str | None,
+    at: int | None,
+) -> tuple[str | None, dict[str, str] | None, dict | None]:
+    """Replace ``{{totp}}`` with a code generated at send time.
+
+    A code computed in an earlier tool call is often expired by the time the
+    request is built. The placeholder is filled inside this request.
+    """
+    marked_body = body is not None and _TOTP_MARK in body
+    marked_headers = False
+    if headers:
+        marked_headers = any(
+            isinstance(value, str) and _TOTP_MARK in value for value in headers.values()
+        )
+    if not secret:
+        if marked_body or marked_headers:
+            raise ToolError(f"{_TOTP_MARK} is present but totp_secret was not set")
+        return body, headers, None
+    info = fresh_totp(secret, at=at)
+    code = info["code"]
+    if not marked_body and not marked_headers:
+        raise ToolError(
+            f"totp_secret was set but neither body nor headers contain {_TOTP_MARK}"
+        )
+    if marked_body and body is not None:
+        body = body.replace(_TOTP_MARK, code)
+    if marked_headers and headers is not None:
+        headers = {
+            key: value.replace(_TOTP_MARK, code) if isinstance(value, str) else value
+            for key, value in headers.items()
+        }
+    return body, headers, {
+        "code": code,
+        "seconds_remaining": info["seconds_remaining"],
+    }
+
+
+def _render_body(content: bytes, *, status: int, content_type: str, limit: int) -> dict:
+    """Text body, or base64 when the bytes are not UTF-8.
+
+    Directory listings return ``listing`` and a one-line body. The page HTML
+    is mostly stylesheet and pushes the filenames past the truncation cap.
+    """
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        chunk = content[:limit]
+        rendered = {
+            "kind": "binary",
+            "body_encoding": "base64",
+            "body": base64.b64encode(chunk).decode("ascii"),
+        }
+        if len(content) > limit:
+            rendered["body_truncated"] = True
+        return rendered
+    kind = classify(status=status, content_type=content_type, body=text)
+    rendered: dict = {"kind": kind}
+    if kind == "directory_listing":
+        listing = directory_entries(text)
+        if listing:
+            rendered["listing"] = listing
+            rendered["body"] = f"{len(listing)} entries"
+            return rendered
+    rendered["body"] = truncate(text, limit)
+    return rendered
+
+
+def _set_cookies(response: httpx.Response) -> list[str]:
+    getter = getattr(response.headers, "get_list", None)
+    if getter is None:
+        raw = response.headers.get("set-cookie")
+        return [raw] if raw else []
+    return list(getter("set-cookie"))
+
+
 @mcp.tool(
     tags={"recon", "active"},
     annotations={"openWorldHint": True},
@@ -110,6 +201,8 @@ async def http_request(
     fields: list[str] | None = None,
     multipart: list[dict] | None = None,
     body_limit: int | None = None,
+    totp_secret: str | None = None,
+    totp_at: int | None = None,
     verify_tls: bool = False,
     follow_redirects: bool = True,
 ) -> dict:
@@ -118,11 +211,20 @@ async def http_request(
     This tool does not store cookies or tokens. When a JSON body contains a
     token, send it on the next call yourself: ``Authorization: Bearer <token>``
     and ``Cookie: token=<token>``. Some APIs ignore the header and read only
-    the cookie.
+    the cookie. ``set_cookies`` lists each ``Set-Cookie`` value from this
+    response so the next call can replay it.
 
     ``fields`` projects a JSON body before truncation. ``data[].name`` keeps
     ``name`` on each object in ``data``. Use it when ``body`` ends with a
     truncation note and you need a few keys from a large document.
+
+    A directory listing sets ``listing`` to ``[{name, href}, ...]`` and
+    replaces ``body`` with the entry count. The HTML of those pages is mostly
+    CSS, and the filenames sit past the truncation cap.
+
+    A response that is not valid UTF-8 sets ``body_encoding`` to ``base64``
+    and ``kind`` to ``binary``. Decode ``body`` before saving a file. Text
+    responses stay plain strings.
 
     ``multipart`` builds a multipart body. Each part has ``name``, and
     optionally ``filename``, ``content``, ``content_type``, and ``size``.
@@ -130,21 +232,29 @@ async def http_request(
     trimmed to fit, so a large file upload does not have to be pasted in.
     Do not send ``body`` and ``multipart`` together.
 
+    ``totp_secret`` replaces every ``{{totp}}`` in ``body`` and header values
+    with a code generated when the request is sent. A code from an earlier
+    ``crypto_totp`` call is often already expired.
+
     Args:
         url: Full target URL, e.g. https://example.com/api/login.
         method: HTTP method (GET, POST, PUT, DELETE, OPTIONS, ...).
         headers: Request headers to send.
-        body: Raw request body.
+        body: Raw request body. ``{{totp}}`` is replaced when totp_secret is set.
         params: Query parameters.
         fields: JSON paths to keep. ``[]`` walks a list (``data[].solved``).
         multipart: File or form parts. ``size`` pads with A up to 2000000 bytes.
         body_limit: Response characters to keep (default 8000, max 100000).
+            For a binary body this is the number of raw bytes that are encoded.
+        totp_secret: Base32 TOTP secret. Requires ``{{totp}}`` in the body or headers.
+        totp_at: Unix time for the TOTP code. Omit for the current time.
         verify_tls: Verify TLS certificates (default False for testing).
         follow_redirects: Follow 3xx redirects.
     """
     if body is not None and multipart:
         raise ToolError("pass body or multipart, not both")
     limit = _body_limit(body_limit)
+    body, headers, totp_info = _apply_totp(body, headers, totp_secret, totp_at)
     files = _multipart_files(multipart) if multipart else None
     request_headers = _drop_content_type(headers) if files else headers
     async with _client(verify_tls, follow_redirects) as client:
@@ -159,7 +269,7 @@ async def http_request(
             )
         except httpx.HTTPError as e:
             raise ToolError(f"Request failed: {e}")
-    text = resp.text
+    content_type = resp.headers.get("content-type", "")
     result = {
         "status": resp.status_code,
         "reason": resp.reason_phrase,
@@ -169,16 +279,31 @@ async def http_request(
         "elapsed_ms": round(resp.elapsed.total_seconds() * 1000),
         "body_length": len(resp.content),
     }
+    cookies = _set_cookies(resp)
+    if cookies:
+        result["set_cookies"] = cookies
+    if totp_info is not None:
+        result["totp"] = totp_info
     if fields:
         try:
-            projected = project_json(json.loads(resp.text), fields)
-        except json.JSONDecodeError:
+            projected = project_json(json.loads(resp.content.decode("utf-8")), fields)
+        except (UnicodeDecodeError, json.JSONDecodeError):
             result["fields_applied"] = False
             result["fields_error"] = "response body is not JSON"
+            result.update(_render_body(
+                resp.content, status=resp.status_code, content_type=content_type, limit=limit,
+            ))
         else:
-            text = json.dumps(projected, separators=(",", ":"))
             result["fields_applied"] = True
-    result["body"] = truncate(text, limit)
+            result["kind"] = "json"
+            result["body"] = truncate(
+                json.dumps(projected, separators=(",", ":")),
+                limit,
+            )
+        return result
+    result.update(_render_body(
+        resp.content, status=resp.status_code, content_type=content_type, limit=limit,
+    ))
     return result
 
 
@@ -261,6 +386,75 @@ async def http_batch(
     async with _client(verify_tls, follow_redirects) as client:
         await asyncio.gather(*(one(index, req) for index, req in enumerate(calls)))
     return {"count": len(calls), "results": results}
+
+
+@mcp.tool(
+    tags={"recon", "active"},
+    annotations={"openWorldHint": True},
+    timeout=120.0,
+)
+async def http_vary(
+    url: str,
+    method: str = "POST",
+    headers: dict[str, str] | None = None,
+    bodies: list[str] | None = None,
+    verify_tls: bool = False,
+    follow_redirects: bool = True,
+) -> dict:
+    """Send the same request with each body, in order, and return every status.
+
+    Use this for a password list, a coupon list, or any other case where one
+    URL is tried with many bodies. ``recon_http_batch`` overlaps different
+    requests and stops at 10. This tool is sequential, caps at 20, and keeps
+    a short body preview so the interesting status is visible without a
+    follow-up call per guess.
+
+    Args:
+        url: Full target URL.
+        method: HTTP method (default POST).
+        headers: Headers sent with every body.
+        bodies: 1 to 20 raw request bodies.
+        verify_tls: Verify TLS certificates (default False for testing).
+        follow_redirects: Follow 3xx redirects.
+    """
+    if not isinstance(bodies, list) or not bodies:
+        raise ToolError("bodies must be a non-empty list")
+    if len(bodies) > _VARY_MAX:
+        raise ToolError(f"at most {_VARY_MAX} bodies")
+    for index, item in enumerate(bodies):
+        if not isinstance(item, str):
+            raise ToolError(f"bodies[{index}] must be a string")
+    if headers is not None and not isinstance(headers, dict):
+        raise ToolError("headers must be an object")
+    if not isinstance(method, str) or not method.strip():
+        raise ToolError("method must be a string")
+
+    results: list[dict] = []
+    async with httpx.AsyncClient(
+        timeout=_VARY_TIMEOUT,
+        verify=verify_tls,
+        follow_redirects=follow_redirects,
+        headers={"User-Agent": UA},
+    ) as client:
+        for index, item in enumerate(bodies):
+            try:
+                response = await client.request(
+                    method.upper(),
+                    url,
+                    headers=headers,
+                    content=item,
+                )
+            except httpx.HTTPError as exc:
+                results.append({"index": index, "error": str(exc)})
+                continue
+            results.append({
+                "index": index,
+                "status": response.status_code,
+                "body_length": len(response.content),
+                "body": truncate(response.text, _VARY_BODY_CHARS),
+            })
+    hits = [item["index"] for item in results if item.get("status") and item["status"] < 400]
+    return {"url": url, "count": len(results), "hits": hits, "results": results}
 
 
 _SECURITY_HEADERS = {
@@ -863,8 +1057,9 @@ def _observed(path: str, response: httpx.Response, baseline: dict | None) -> dic
     if kind == "json":
         entry["preview"] = preview(response.text, 500)
     elif kind == "directory_listing":
-        hrefs = re.findall(r"""href=["']([^"'#?]+)["']""", response.text, re.IGNORECASE)
-        entry["entries"] = [href for href in hrefs if href not in ("/", ".", "..")][:40]
+        listing = directory_entries(response.text)
+        entry["listing"] = listing
+        entry["entries"] = [item["href"] for item in listing][:40]
     return entry
 
 

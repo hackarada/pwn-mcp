@@ -127,6 +127,21 @@ class Handler(BaseHTTPRequestHandler):
                        ctype="application/json")
         elif path == "/long":
             self._send(200, b"L" * 20000, ctype="text/plain")
+        elif path == "/binary":
+            self._send(200, b"\xff\xfe\x00pyc", ctype="application/octet-stream")
+        elif path == "/files":
+            page = (
+                "<html><head><title>listing directory /ftp</title></head><body>"
+                "<a href=\"ftp/acquisitions.md\" class=\"icon\">"
+                "<span class=\"name\">acquisitions.md</span></a>"
+                "<a href=\"ftp/quarantine\" class=\"icon icon-directory\">"
+                "<span class=\"name\">quarantine</span></a>"
+                "<a href=\"..\"><span class=\"name\">..</span></a>"
+                "</body></html>"
+            )
+            self._send(200, page.encode())
+        elif path == "/set-cookie":
+            self._send(200, b"ok", {"Set-Cookie": "token=abc123; Path=/"})
         elif path == "/static/app.js":
             self._send(200, APP_JS.encode(), ctype="application/javascript")
         elif path == "/static/app.js.map":
@@ -193,6 +208,15 @@ class Handler(BaseHTTPRequestHandler):
                        ctype="application/json")
             return
         body = raw.decode()
+        if path == "/guess":
+            if b"correct" in raw:
+                self._send(200, b'{"ok":true}', ctype="application/json")
+            else:
+                self._send(401, b"no", ctype="text/plain")
+            return
+        if path == "/totp":
+            self._send(200, raw, ctype="application/json")
+            return
         if path == "/login":
             if "OR 1=1" in body:
                 self._send(

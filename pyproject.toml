@@ -5,7 +5,9 @@ description = "MCP server exposing web, API, and SPA security testing tools for 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastmcp>=2.11.0",
+    # FastMCP 4 pulls httpx2 (h11>=0.16) and typing-extensions>=4.14.1.
+    # mitmproxy 11 pins h11<=0.14; mitmproxy 12 pins typing-extensions<=4.14.
+    "fastmcp>=3.4.7,<4",
     "httpx>=0.28.0",
     "dnspython>=2.7.0",
     "cryptography>=43.0.0",

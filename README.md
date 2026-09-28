@@ -102,8 +102,10 @@ boot (and locally via `dbmate --migrations-dir .migration up`).
 ## Agent workflow
 
 The **agent owns session memory** (what was found, next steps, URL lists).
-MCP does not keep a recon notepad. Use MCP for **capabilities** and for
-**jobs** when a scan would exceed a single tool-call timeout.
+MCP does not keep a recon notepad. Call `list_resources`, then `read_resource`
+with uri `pwn://guide`, for how to reach a target and how to read a result.
+`tools/list` is the catalog. Use MCP for **capabilities** and for **jobs**
+when a scan would exceed a single tool-call timeout.
 
 Typical loop:
 
@@ -119,6 +121,13 @@ Typical loop:
 `playbook_run` only batches those calls and returns the step data. It does not
 decide that the test is finished.
 
+`recon_http_vary` repeats one URL with up to 20 bodies and reports which
+statuses succeeded. `recon_http_request` returns `listing` for a directory
+index (the HTML is mostly CSS), `body_encoding=base64` when the body is not
+UTF-8, and `set_cookies` from `Set-Cookie`. It still does not keep a session.
+Put `{{totp}}` in the body and pass `totp_secret` so the code is generated
+when the request goes out.
+
 **Wrappers vs `scan_cli_run`:** prefer typed tools (`scan_nuclei_scan`,
 `scan_httpx_probe`, …). Use `scan_cli_run` when you need flags the wrapper
 does not expose. Shell metacharacters, absolute paths, and file I/O flags
@@ -131,7 +140,7 @@ The agent decides when a target has no distinct documents left to request.
 
 | Namespace   | Tools |
 |---|---|
-| `recon_`    | `http_request`, `http_batch`, `security_headers`, `tls_cert_info`, `tech_fingerprint`, `fetch_robots`, `dns_lookup`, `whois_lookup`, `cors_check`, `crawl_links`, `js_analyze`, `api_discover`, `probe_paths`, `websocket_probe`, `scope_check`, `secrets_scan`, `session_extract`, `url_triage` |
+| `recon_`    | `http_request`, `http_batch`, `http_vary`, `security_headers`, `tls_cert_info`, `tech_fingerprint`, `fetch_robots`, `dns_lookup`, `whois_lookup`, `cors_check`, `crawl_links`, `js_analyze`, `api_discover`, `probe_paths`, `websocket_probe`, `scope_check`, `secrets_scan`, `session_extract`, `url_triage` |
 | `crypto_`   | `encode`, `decode`, `hash_text`, `hash_identify`, `jwt_decode`, `jwt_sign`, `jwt_attack`, `totp`, `hash_crack_enqueue`, `transform`, `xor`, `caesar` |
 | `scan_`     | `port_scan`, `nmap_scan`, `subdomain_enum`, `subfinder_enum`, `httpx_probe`, `katana_crawl`, `naabu_scan`, `dnsx_resolve`, `nuclei_list_tags`, `nuclei_list_templates`, `nuclei_templates_version`, `nuclei_scan`, `cli_tools`, `cli_run`, `dir_bruteforce`, `content_discover`, `param_fuzz`, `reflected_xss_probe`, `open_redirect_check`, `graphql_probe`, `graphql_deep`, `ssti_probe`, `sqli_probe`, `ssrf_probe`, `idor_probe`, `cache_probe`, `host_header_probe`, `subdomain_takeover_check`, `cloud_bucket_probe` |
 | `proxy_`    | `start`, `stop`, `status`, `history`, `get_traffic`, `endpoints`, `set_headers`, `clear`, `intercept`, `held`, `resume`, `replay`, `match_replace`, `match_replace_list`, `export_har`, `export_burp` |

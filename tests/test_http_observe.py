@@ -4,6 +4,7 @@ from pwn_mcp.http_observe import (
     baseline_from,
     classify,
     classify_reflection,
+    directory_entries,
     matches_baseline,
     project_json,
 )
@@ -28,6 +29,16 @@ def test_json_and_listing_are_not_the_shell():
     assert classify(
         status=200, content_type="text/html", body=listing, baseline=baseline,
     ) == "directory_listing"
+
+
+def test_directory_entries_keep_names_and_drop_parents():
+    page = (
+        "<html><title>listing directory /ftp</title>"
+        "<a href='ftp/notes.md'><span class='name'>notes.md</span></a>"
+        "<a href='..'><span class='name'>..</span></a>"
+        "</html>"
+    )
+    assert directory_entries(page) == [{"name": "notes.md", "href": "ftp/notes.md"}]
 
 
 def test_reflection_flags_use_the_payload_window_only():
